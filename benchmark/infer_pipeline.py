@@ -171,14 +171,29 @@ def segment_page(img_file: Path) -> tuple[list[Image.Image], str]:
     return crops, "projection"
 
 
+def load_processor(model_id: str):
+    """Repos without a tokenizer.json break AutoTokenizer on transformers 5.x,
+    which dropped slow-tokenizer conversion; the fast class still reads the
+    vocab.json/merges.txt pair directly."""
+    from transformers import AutoImageProcessor, RobertaTokenizerFast, TrOCRProcessor
+
+    try:
+        return TrOCRProcessor.from_pretrained(model_id)
+    except Exception:
+        return TrOCRProcessor(
+            image_processor=AutoImageProcessor.from_pretrained(model_id),
+            tokenizer=RobertaTokenizerFast.from_pretrained(model_id),
+        )
+
+
 def load_recognizer(model_id: str, device: str, fallbacks: list[str] | None = None):
-    from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+    from transformers import VisionEncoderDecoderModel
 
     candidates = [model_id] + (fallbacks or [])
     last_err = None
     for mid in candidates:
         try:
-            processor = TrOCRProcessor.from_pretrained(mid)
+            processor = load_processor(mid)
             model = VisionEncoderDecoderModel.from_pretrained(mid)
             model.to(device)
             model.eval()

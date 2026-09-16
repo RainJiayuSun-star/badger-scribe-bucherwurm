@@ -32,6 +32,12 @@ LARGE_MODELS = {
     "allenai/olmOCR-2-7B-1025",
 }
 
+DEEPSEEK_OCR_ID = "deepseek-ai/DeepSeek-OCR"
+
+# DeepSeek-OCR is task-prompted, not instruction-following: the shared verbatim
+# prompt makes it emit nothing at all, so it runs on its own canonical prompt.
+DEEPSEEK_OCR_PROMPT = "Free OCR."
+
 
 def resolve_model(name: str) -> str:
     return MODEL_ALIASES.get(name.lower(), name)
@@ -112,9 +118,109 @@ def write_preds(path: Path, page_order: list[str], preds: dict[str, str]) -> Non
                 w.writerow({"page_id": pid, "text": preds[pid]})
 
 
+def require_transformers_v4() -> None:
+    """DeepSeek-OCR's remote code targets transformers 4.x and cannot run on 5.x.
+
+    With use_mla=False its decoder borrows transformers' own LlamaAttention,
+    whose contract changed in 5.x: rotary embeddings are now passed in by the
+    parent model rather than computed from position_ids. Run this model under
+    an overlay instead:
+
+        uv run --with "transformers==4.46.3" python benchmark/infer_vlm.py ...
+    """
+    import transformers
+
+    if int(transformers.__version__.split(".")[0]) >= 5:
+        raise SystemExit(
+            f"DeepSeek-OCR needs transformers 4.x (found {transformers.__version__}); "
+            'rerun with: uv run --with "transformers==4.46.3" python benchmark/infer_vlm.py ...'
+        )
+
+
+def restore_v4_config_defaults(config) -> int:
+    """Re-apply defaults that a transformers 4.x config __init__ would have set.
+
+    In 5.x the base __init__ rebuilds the instance dict, so attributes a remote
+    config assigns before calling super() are dropped and only config.json keys
+    survive. Reading the defaults back off each __init__ signature restores them.
+    """
+    import inspect
+
+    import transformers.configuration_utils as cfg_utils
+
+    # 5.x renamed PretrainedConfig to PreTrainedConfig.
+    base_config = getattr(cfg_utils, "PreTrainedConfig", None) or cfg_utils.PretrainedConfig
+
+    restored = 0
+    seen: set[int] = set()
+    stack = [config]
+    while stack:
+        cfg = stack.pop()
+        if id(cfg) in seen:
+            continue
+        seen.add(id(cfg))
+        for klass in type(cfg).__mro__:
+            init = klass.__dict__.get("__init__")
+            if init is None:
+                continue
+            for name, param in inspect.signature(init).parameters.items():
+                if param.default is not inspect.Parameter.empty and not hasattr(cfg, name):
+                    setattr(cfg, name, param.default)
+                    restored += 1
+        stack.extend(v for v in vars(cfg).values() if isinstance(v, base_config))
+    return restored
+
+
+def restore_vision_position_ids(model) -> None:
+    """The vision encoder registers position_ids as arange, but the checkpoint
+    omits it and 5.x re-initialises missing buffers, leaving indices that send
+    the position embedding lookup out of bounds."""
+    import torch
+
+    for module in model.modules():
+        num_positions = getattr(module, "num_positions", None)
+        if num_positions is None or not hasattr(module, "position_ids"):
+            continue
+        ids = torch.arange(num_positions, device=module.position_ids.device)
+        module.position_ids = ids.expand((1, -1))
+
+
+def load_deepseek_ocr(model_id: str, device: str):
+    import torch
+    from transformers import AutoConfig, AutoModel, AutoTokenizer
+
+    if device != "cuda":
+        raise SystemExit("DeepSeek-OCR requires CUDA; its infer() hardcodes .cuda()")
+
+    require_transformers_v4()
+
+    import transformers
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    restore_v4_config_defaults(config)
+
+    dtype_kw = "dtype" if int(transformers.__version__.split(".")[0]) >= 5 else "torch_dtype"
+    model = AutoModel.from_pretrained(
+        model_id,
+        config=config,
+        trust_remote_code=True,
+        use_safetensors=True,
+        low_cpu_mem_usage=True,
+        attn_implementation="eager",
+        **{dtype_kw: torch.bfloat16},
+    )
+    model = model.eval().cuda().to(torch.bfloat16)
+    restore_vision_position_ids(model)
+    return model, tokenizer
+
+
 def load_model(model_id: str, device: str, dtype: str):
     import torch
     from transformers import AutoProcessor
+
+    if model_id == DEEPSEEK_OCR_ID:
+        return load_deepseek_ocr(model_id, device)
 
     try:
         from transformers import AutoModelForImageTextToText as AutoVLM
@@ -163,10 +269,36 @@ def move_inputs(inputs, device: str, model):
     return out
 
 
+def transcribe_deepseek_ocr(model, tokenizer, img_file: Path) -> str:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = model.infer(
+            tokenizer,
+            prompt=f"<image>\n{DEEPSEEK_OCR_PROMPT}",
+            image_file=str(img_file),
+            output_path=tmp,
+            base_size=1024,
+            image_size=640,
+            crop_mode=True,
+            save_results=False,
+            eval_mode=True,
+        )
+
+    text = (out or "").strip()
+    for stop in ("<|end\u2581of\u2581sentence|>", "<|end_of_sentence|>", "<\uff5cend\u2581of\u2581sentence\uff5c>"):
+        if text.endswith(stop):
+            text = text[: -len(stop)]
+    return text.strip()
+
+
 def transcribe_page(model, processor, img_file: Path, prompt: str, device: str,
                     max_new_tokens: int, max_pixels: int) -> str:
     import torch
     from PIL import Image
+
+    if type(model).__name__ == "DeepseekOCRForCausalLM":
+        return transcribe_deepseek_ocr(model, processor, img_file)
 
     image = Image.open(img_file).convert("RGB")
     messages = [{
@@ -248,6 +380,7 @@ def main() -> None:
         "device": device,
         "dtype": dtype,
         "with_metadata": args.with_metadata,
+        "prompt_override": DEEPSEEK_OCR_PROMPT if model_id == DEEPSEEK_OCR_ID else None,
         "max_new_tokens": args.max_new_tokens,
         "max_pixels": args.max_pixels,
         "n_pages": len(ids),
