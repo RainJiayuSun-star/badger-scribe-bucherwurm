@@ -1,4 +1,4 @@
-# Cooler Badger Scribe
+# Badger Scribe Project - UW Madison MLM26 Challenge Team bucherwurm
 
 UW–Madison MLM26 / [Kaggle Badger Scribe](https://www.kaggle.com/competitions/badger-scribe): verbatim transcription of 19th-century archival pages with open-weight models.
 
