@@ -25,10 +25,9 @@ uv run python benchmark/eval.py --run-id smoke-churro --split smoke
 3060 7B/8B example:
 
 ```bash
+uv sync --extra cuda
 uv run python benchmark/infer_vlm.py --model qwen2.5-vl-7b --split smoke --run-id smoke-qwen25vl-7b --device cuda --dtype 4bit
 uv run python benchmark/eval.py --run-id smoke-qwen25vl-7b --split smoke --append-results
 ```
 
 `--device auto` prefers CUDA, then MPS, then CPU. Do not mix Mac and 3060 wall-clock in one ranking; CER is comparable.
-
-`uv pip install -r benchmark/requirements.txt` still works as a pip-style fallback. The lockfile is `uv.lock`.

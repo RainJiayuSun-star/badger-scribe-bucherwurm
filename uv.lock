@@ -302,7 +302,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=1.24" },
     { name = "pandas", specifier = ">=2.0" },
     { name = "pillow", specifier = ">=10.0" },
-    { name = "protobuf", specifier = ">=5" },
+    { name = "protobuf", specifier = ">=5.0" },
     { name = "qwen-vl-utils", specifier = ">=0.0.8" },
     { name = "sentencepiece", specifier = ">=0.2" },
     { name = "torch", specifier = ">=2.2" },
