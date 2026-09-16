@@ -8,20 +8,27 @@ UW–Madison MLM26 / [Kaggle Badger Scribe](https://www.kaggle.com/competitions/
 - **Metric definitions:** [measurements.md](measurements.md)
 - **Numbers from runs:** [results/](results/)
 
-Data lives in `badger-scribe-data/` (not committed). Freeze the local val split, then infer and score:
+Data lives in `badger-scribe-data/` (not committed). Packages are managed with [uv](https://docs.astral.sh/uv/) (`pyproject.toml` + `uv.lock`).
 
 ```bash
-python benchmark/make_holdout.py
-python benchmark/infer_vlm.py --model churro --split smoke --run-id smoke-churro
-python benchmark/eval.py --run-id smoke-churro --split smoke
+# Mac / CPU / MPS (no 4-bit)
+uv sync
+
+# Windows RTX 3060 (bitsandbytes 4-bit)
+uv sync --extra cuda
+
+uv run python benchmark/make_holdout.py
+uv run python benchmark/infer_vlm.py --model churro --split smoke --run-id smoke-churro
+uv run python benchmark/eval.py --run-id smoke-churro --split smoke
 ```
 
-On the Windows RTX 3060 (CUDA, 4-bit for 7B/8B):
+3060 7B/8B example:
 
 ```bash
-pip install -r benchmark/requirements.txt bitsandbytes
-python benchmark/infer_vlm.py --model qwen2.5-vl-7b --split smoke --run-id smoke-qwen25vl-7b --device cuda --dtype 4bit
-python benchmark/eval.py --run-id smoke-qwen25vl-7b --split smoke --append-results
+uv run python benchmark/infer_vlm.py --model qwen2.5-vl-7b --split smoke --run-id smoke-qwen25vl-7b --device cuda --dtype 4bit
+uv run python benchmark/eval.py --run-id smoke-qwen25vl-7b --split smoke --append-results
 ```
 
-`--device auto` already prefers CUDA, then MPS, then CPU. Do not mix Mac and 3060 wall-clock in one ranking; CER is comparable.
+`--device auto` prefers CUDA, then MPS, then CPU. Do not mix Mac and 3060 wall-clock in one ranking; CER is comparable.
+
+`uv pip install -r benchmark/requirements.txt` still works as a pip-style fallback. The lockfile is `uv.lock`.

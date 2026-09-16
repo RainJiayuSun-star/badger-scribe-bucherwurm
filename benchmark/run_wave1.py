@@ -7,9 +7,19 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PY = ROOT / ".venv" / "bin" / "python"
-if not PY.exists():
-    PY = Path(sys.executable)
+
+
+def venv_python() -> Path:
+    for candidate in (
+        ROOT / ".venv" / "bin" / "python",
+        ROOT / ".venv" / "Scripts" / "python.exe",
+    ):
+        if candidate.exists():
+            return candidate
+    return Path(sys.executable)
+
+
+PY = venv_python()
 
 INFER = ROOT / "benchmark" / "infer_vlm.py"
 EVAL = ROOT / "benchmark" / "eval.py"
