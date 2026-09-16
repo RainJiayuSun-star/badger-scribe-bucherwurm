@@ -1,0 +1,14 @@
+# Pip fallback. Prefer: uv sync
+# Regenerated conceptually from pyproject.toml (not a full lock).
+pandas>=2.0
+pillow>=10.0
+numpy>=1.24
+torch>=2.2
+torchvision>=0.17
+transformers>=4.49.0
+accelerate>=0.33
+qwen-vl-utils>=0.0.8
+sentencepiece>=0.2
+protobuf>=5
+# CUDA-only 4-bit: uv sync --extra cuda
+# bitsandbytes>=0.43
