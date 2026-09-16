@@ -6,6 +6,10 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "accelerate>=0.33",
+    "addict>=2.4",
+    "easydict>=1.13",
+    "einops>=0.8",
+    "matplotlib>=3.8",
     "numpy>=1.24",
     "pandas>=2.0",
     "pillow>=10.0",
@@ -20,7 +24,18 @@ dependencies = [
 [project.optional-dependencies]
 cuda = [
     "bitsandbytes>=0.43",
+    "torch>=2.2",
+    "torchvision>=0.17",
 ]
 
 [tool.uv]
 package = false
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu126", extra = "cuda" }]
+torchvision = [{ index = "pytorch-cu126", extra = "cuda" }]
