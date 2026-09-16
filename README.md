@@ -1,2 +1,1 @@
-# Cooler Badger Scribe Project - UW Madison MLM26 Challenge
- 
+# Badger Scribe Project - UW Madison MLM26 Challenge Team bucherwurm
