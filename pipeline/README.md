@@ -26,7 +26,7 @@ Use `--prompt-file path/to/prompt.txt` only for a deliberate prompt experiment.
 2. From the project root, make a one-page smoke request:
 
    ```bash
-   source ../badgerchat/env.sh
+   source pipeline/env.sh
    python3 pipeline/transcribe_gateway.py \
      --input-csv badger-scribe-data/test.csv \
      --image-dir badger-scribe-data/images \
