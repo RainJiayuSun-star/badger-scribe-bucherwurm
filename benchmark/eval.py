@@ -22,10 +22,14 @@ def load_metric():
     return mod
 
 
-def solution_csv(split: str) -> Path:
+def solution_csv(split: str, explicit_path: Path | None = None) -> Path:
+    if explicit_path:
+        return explicit_path
     if split == "smoke":
         return splits_dir() / "smoke_solution.csv"
-    return splits_dir() / "holdout_solution.csv"
+    if split == "val":
+        return splits_dir() / "holdout_solution.csv"
+    raise ValueError("--solution-csv is required for a split other than smoke or val")
 
 
 def read_csv(path: Path) -> list[dict]:
@@ -48,7 +52,10 @@ def mean(xs: list[float]) -> float | None:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--run-id", required=True)
-    p.add_argument("--split", default="smoke", choices=["smoke", "val"])
+    p.add_argument("--split", default="smoke",
+                   help="Result label; smoke and val use the original split unless --solution-csv is supplied")
+    p.add_argument("--solution-csv", type=Path,
+                   help="Ground-truth CSV for a named or release-specific split")
     p.add_argument("--append-results", action="store_true")
     p.add_argument("--write-table", action="store_true",
                    help="rebuild results/wave1.md from results/wave1.csv")
@@ -78,14 +85,14 @@ def qualitative_examples(sol_rows: list[dict], pred_map: dict[str, str], metric,
     return out
 
 
-def eval_run(run_id: str, split: str) -> dict:
+def eval_run(run_id: str, split: str, explicit_solution: Path | None = None) -> dict:
     metric = load_metric()
     run_dir = runs_dir() / run_id
     pred_path = run_dir / "preds.csv"
     if not pred_path.exists():
         raise SystemExit(f"missing {pred_path}")
 
-    sol_path = solution_csv(split)
+    sol_path = solution_csv(split, explicit_solution)
     sol_rows = read_csv(sol_path)
     pred_rows = read_csv(pred_path)
     pred_map = {r["page_id"]: r.get("text", "") for r in pred_rows}
@@ -384,7 +391,7 @@ def main() -> None:
         path = write_wave1_md()
         print(f"wrote {path}")
         return
-    m = eval_run(args.run_id, args.split)
+    m = eval_run(args.run_id, args.split, args.solution_csv)
     if args.append_results:
         csv_path = append_results(m)
         md_path = write_wave1_md(csv_path)
