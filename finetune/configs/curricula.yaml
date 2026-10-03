@@ -1,0 +1,15 @@
+curricula:
+  kade: {stages: [[kade_letters]]}
+  dominy: {stages: [[dominy_accounts]]}
+  survey: {stages: [[survey_notes]]}
+  kade-dominy: {stages: [[kade_letters, dominy_accounts]]}
+  kade-survey: {stages: [[kade_letters, survey_notes]]}
+  dominy-survey: {stages: [[dominy_accounts, survey_notes]]}
+  kade-dominy-survey: {stages: [[kade_letters, dominy_accounts, survey_notes]]}
+  kade-then-dominy: {stages: [[kade_letters], [dominy_accounts]]}
+  dominy-then-survey: {stages: [[dominy_accounts], [survey_notes]]}
+  kade-then-dominy-then-survey: {stages: [[kade_letters], [dominy_accounts], [survey_notes]]}
+  dominy-then-kade: {stages: [[dominy_accounts], [kade_letters]]}
+  survey-then-dominy: {stages: [[survey_notes], [dominy_accounts]]}
+  survey-then-dominy-then-kade: {stages: [[survey_notes], [dominy_accounts], [kade_letters]]}
+  kade-no-augmentation: {stages: [[kade_letters]]}

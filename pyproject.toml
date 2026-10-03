@@ -27,6 +27,14 @@ cuda = [
     "torch>=2.2",
     "torchvision>=0.17",
 ]
+finetune = [
+    "bitsandbytes>=0.43",
+    "datasets>=2.20",
+    "peft>=0.12",
+    "pyyaml>=6.0",
+    "tensorboard>=2.17",
+    "wandb>=0.17",
+]
 
 [tool.uv]
 package = false
