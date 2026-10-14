@@ -1,0 +1,16 @@
+version: 1
+enabled: true
+probability: 0.8
+rotation_probability: 0.4
+rotation_degrees: 1.5
+contrast_probability: 0.5
+contrast_jitter: 0.12
+brightness_probability: 0.5
+brightness_jitter: 0.10
+blur_probability: 0.20
+blur_radius: 0.7
+jpeg_probability: 0.25
+jpeg_min_quality: 72
+jpeg_max_quality: 92
+noise_probability: 0.18
+noise_amount: 5
