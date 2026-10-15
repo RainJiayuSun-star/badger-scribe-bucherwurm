@@ -114,6 +114,12 @@ python3 benchmark/make_holdout_release09.py \
   --data-root badger-scribe-data
 ```
 
+The `*_solution.csv` files and `splits/release_09/train_full.json` contain
+competition label text, so they are **not committed**. After a fresh clone, run
+`python benchmark/make_solutions.py` to rebuild the four solution CSVs from
+`train.csv` and the saved split IDs (it does not touch the split JSON files).
+`train_full.json` is rebuilt by `benchmark/make_holdout_release09.py`.
+
 Use `splits/release_09/smoke_solution.csv` for the 12-page Release 09 smoke
 set and `splits/release_09/holdout_solution.csv` for the full extended
 validation set. Keep results from this split separate from `results/wave1.*`.
