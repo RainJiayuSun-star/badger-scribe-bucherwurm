@@ -18,12 +18,13 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 from collections import Counter
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_DATA_ROOT = ROOT.parent / "badger-scribe-data-09"
+DEFAULT_DATA_ROOT = Path(os.environ.get("BADGER_SCRIBE_DATA") or ROOT / "badger-scribe-data")
 ORIGINAL_HOLDOUT = ROOT / "splits" / "holdout.json"
 ORIGINAL_SMOKE = ROOT / "splits" / "smoke.json"
 NEW_SURVEY_DOCS = (

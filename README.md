@@ -38,7 +38,7 @@ after every successful page, so `--continue` recovers an interrupted run.
 ```bash
 python3 pipeline/transcribe_gateway.py \
   --input-csv splits/release_09/smoke_solution.csv \
-  --image-dir /Users/rains/rainworkspace/UWMadison/mlm26/badger-scribe-data-09/images \
+  --image-dir badger-scribe-data/images \
   --output-csv runs/gateway-churro-release09-smoke/preds.csv \
   --continue
 ```
@@ -48,7 +48,7 @@ For the complete Release 09 validation set, change only the input and run ID:
 ```bash
 python3 pipeline/transcribe_gateway.py \
   --input-csv splits/release_09/holdout_solution.csv \
-  --image-dir /Users/rains/rainworkspace/UWMadison/mlm26/badger-scribe-data-09/images \
+  --image-dir badger-scribe-data/images \
   --output-csv runs/gateway-churro-release09-val/preds.csv \
   --continue
 ```
@@ -85,15 +85,15 @@ evaluator:
 
 ```bash
 python3 pipeline/transcribe_gateway.py \
-  --input-csv /Users/rains/rainworkspace/UWMadison/mlm26/badger-scribe-data-09/train.csv \
-  --image-dir /Users/rains/rainworkspace/UWMadison/mlm26/badger-scribe-data-09/images \
+  --input-csv badger-scribe-data/train.csv \
+  --image-dir badger-scribe-data/images \
   --output-csv runs/gateway-churro-release09-train/preds.csv \
   --continue
 
 python benchmark/eval.py \
   --run-id gateway-churro-release09-train \
   --split release09-train-diagnostic \
-  --solution-csv /Users/rains/rainworkspace/UWMadison/mlm26/badger-scribe-data-09/train.csv
+  --solution-csv badger-scribe-data/train.csv
 ```
 
 ## Commands
@@ -111,7 +111,7 @@ documents. Recreate it only from the supplied release directory:
 
 ```bash
 python3 benchmark/make_holdout_release09.py \
-  --data-root ../badger-scribe-data-09
+  --data-root badger-scribe-data
 ```
 
 Use `splits/release_09/smoke_solution.csv` for the 12-page Release 09 smoke

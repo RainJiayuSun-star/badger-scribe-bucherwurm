@@ -8,7 +8,7 @@ Scribe while measuring improvements on human-labelled material. The frozen
 
 ## Data contract
 
-The trainer reads `badger-scribe-data-09/train.csv` and excludes every ID in
+The trainer reads `badger-scribe-data/train.csv` and excludes every ID in
 `splits/release_09/holdout.json`. It makes one deterministic internal
 development partition: 55 human Kade pages, both eligible human Dominy pages,
 and four eligible human survey pages. Kade therefore trains on human labels;

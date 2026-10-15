@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def default_data_root() -> Path:
+    """Same rule as benchmark/common.py: BADGER_SCRIBE_DATA, else <repo>/badger-scribe-data."""
+    env = os.environ.get("BADGER_SCRIBE_DATA")
+    return Path(env).expanduser().resolve() if env else ROOT / "badger-scribe-data"
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -26,7 +33,7 @@ def _load_yaml(path: Path) -> dict[str, Any]:
 def load_config(path: Path) -> dict[str, Any]:
     config = _load_yaml(path)
     config["_config_path"] = str(path.resolve())
-    config.setdefault("data_root", str(ROOT.parent / "badger-scribe-data-09"))
+    config.setdefault("data_root", str(default_data_root()))
     config.setdefault("holdout", str(ROOT / "splits" / "release_09" / "holdout.json"))
     config.setdefault("runs_root", str(ROOT / "runs" / "finetune"))
     config.setdefault("seed", 20261003)
