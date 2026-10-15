@@ -22,7 +22,7 @@ import numpy as np
 
 from .augmentation import OCRAugmenter, load_profile
 from .config import load_config, resolve_curriculum, resolved_config_json
-from .data import image_path, held_ids, make_partition, read_rows, selected_rows, write_manifest
+from .data import fold_partition, image_path, held_ids, make_partition, read_rows, selected_rows, write_manifest
 from .vlm import collate_train, generate_texts, load_model_and_processor
 
 
@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, help="Stop after this many optimizer steps; useful for smoke tests")
     parser.add_argument("--resume", action="store_true", help="Resume from the latest checkpoint in this run directory")
     parser.add_argument("--evaluate-holdout", action="store_true", help="Score the selected best adapter once on the locked Release 09 holdout")
+    parser.add_argument("--fold", type=Path, help="Leave-one-document-out fold file from finetune.folds; its held-out documents become the development set")
     parser.add_argument("--no-wandb", action="store_true")
     return parser.parse_args()
 
@@ -193,7 +194,8 @@ def main() -> int:
     curriculum = resolve_curriculum(config, args.curriculum)
     config["curriculum"] = curriculum["name"]
     config["model_name"] = config.get("model_name", Path(config["model_id"]).name.lower().replace("/", "-"))
-    config["run_id"] = args.run_id or f"{config['model_name']}-{curriculum['name']}-seed{config['seed']}"
+    fold_suffix = f"-fold-{args.fold.stem}" if args.fold else ""
+    config["run_id"] = args.run_id or f"{config['model_name']}-{curriculum['name']}-seed{config['seed']}{fold_suffix}"
     run_dir = Path(config["runs_root"]) / config["run_id"]
     requested_world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if int(config["effective_batch_size"]) % (requested_world_size * int(config["per_device_batch_size"])):
@@ -210,7 +212,13 @@ def main() -> int:
     seed_everything(int(config["seed"]))
 
     rows = read_rows(Path(config["data_root"]))
-    partition = make_partition(rows, held_ids(Path(config["holdout"])), int(config["seed"]))
+    if args.fold:
+        if args.evaluate_holdout:
+            raise SystemExit("--evaluate-holdout and --fold are separate protocols; use one")
+        partition = fold_partition(rows, args.fold)
+        config["fold"] = partition["fold"]
+    else:
+        partition = make_partition(rows, held_ids(Path(config["holdout"])), int(config["seed"]))
     stages = stage_rows(partition, curriculum)
     for stage in stages:
         for row in stage:

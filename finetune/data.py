@@ -51,6 +51,28 @@ def make_partition(rows: list[dict[str, str]], holdout_ids: set[str], seed: int)
     }
 
 
+def fold_partition(rows: list[dict[str, str]], fold_path: Path) -> dict[str, Any]:
+    """Partition from a leave-one-document-out fold file (see finetune/folds.py).
+
+    The fold's held-out documents become the development set, so checkpoints are
+    chosen on writers the model has not trained on.
+    """
+    fold = json.loads(fold_path.read_text(encoding="utf-8"))
+    eval_ids, train_ids = set(fold["eval_ids"]), set(fold["train_ids"])
+    known = {row["page_id"] for row in rows}
+    missing = (eval_ids | train_ids) - known
+    if missing:
+        raise ValueError(f"fold {fold['name']} lists {len(missing)} pages not in train.csv")
+    return {
+        "seed": None,
+        "fold": fold["name"],
+        "holdout_ids": [],
+        "development_ids": sorted(eval_ids),
+        "train": [row for row in rows if row["page_id"] in train_ids],
+        "development": [row for row in rows if row["page_id"] in eval_ids],
+    }
+
+
 def selected_rows(partition: dict[str, Any], categories: Iterable[str], split: str) -> list[dict[str, str]]:
     allowed = set(categories)
     rows = partition[split]
