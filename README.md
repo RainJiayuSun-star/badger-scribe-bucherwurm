@@ -2,12 +2,23 @@
 
 UW–Madison MLM26 / [Kaggle Badger Scribe](https://www.kaggle.com/competitions/badger-scribe): verbatim transcription of 19th-century archival pages with open-weight models.
 
-- **Plan:** [PLAN.md](PLAN.md)
 - **Challenge rules:** [ChallengeDescription.md](ChallengeDescription.md)
+- **Team workflow:** [CONTRIBUTING.md](CONTRIBUTING.md)
 - **Approaches:** [design.md](design.md)
 - **Metric definitions:** [measurements.md](measurements.md)
 - **Numbers from runs:** [results/](results/)
 - **Remote Churro pipeline:** [pipeline/README.md](pipeline/README.md)
+- **Fine-tuning (LoRA, leave-one-document-out folds):** [finetune/README.md](finetune/README.md)
+
+## Repository map
+
+| Directory | What it does |
+| --- | --- |
+| `benchmark/` | Zero-shot inference with local VLMs and OCR baselines, frozen holdout splits, scoring with the official `metric.py` |
+| `pipeline/` | Batch transcription through the BadgerBrain gateway (served Churro), with resumable output |
+| `finetune/` | LoRA fine-tuning of Churro-3B / Qwen-VL: label cleaning, document-level folds, training, evaluation, repetition-loop guard |
+| `splits/` | Saved validation page IDs (label text is rebuilt locally, never committed) |
+| `results/` | Committed benchmark tables |
 
 ## Requirements
 
@@ -15,6 +26,8 @@ UW–Madison MLM26 / [Kaggle Badger Scribe](https://www.kaggle.com/competitions/
 - Competition data in `badger-scribe-data/` (not committed): `train.csv`, `metric.py`, `images/`,
   optional `metadata.csv`. Override the location with `BADGER_SCRIBE_DATA`.
 - 4-bit runs need an NVIDIA GPU (~12 GB). Mac/CPU works in bf16/fp16 but cannot run `--dtype 4bit`.
+- Fine-tuning needs CUDA: `uv sync --extra cuda --extra finetune`. A bf16 LoRA on Churro-3B
+  peaks at about 12 GB, so it fits one 24 GB A5000. See [finetune/README.md](finetune/README.md).
 
 ## Remote Churro workflow: infer, then measure
 
@@ -156,6 +169,17 @@ uv run python benchmark/eval.py --run-id rebuild --split val --write-table      
 `--append-results` appends to `results/wave1.csv` and redraws `results/wave1.md`.
 `--write-table` only rebuilds the markdown, and is skipped unless `--run-id` names a run
 that has no `preds.csv` — hence the placeholder above.
+
+`error_report.py` — builds a local HTML page for reviewing errors: each training page's image
+next to an inline diff of prediction against reference, worst pages first, filterable by
+category and label source. `--baseline` adds a per-page comparison with a second run.
+
+```bash
+python benchmark/error_report.py --preds 'runs/finetune/<run>/zero_shot/*-preds.csv' --out runs/reports/<run>.html
+open runs/reports/<run>.html
+```
+
+The report contains label text, so it stays under `runs/` and is never committed or published.
 
 `run_wave1.py` — runs every model and eval in sequence, continuing past failures.
 

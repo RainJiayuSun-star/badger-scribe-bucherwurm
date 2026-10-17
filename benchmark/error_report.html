@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+  :root { --bg:#fbfaf7; --panel:#fff; --ink:#1d1d1b; --muted:#6b6b66; --line:#e3e1da;
+          --del:#c0392b; --del-bg:#fbe3df; --ins:#1e7d3a; --ins-bg:#dff3e4; --pick:#f0ede4; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#171716; --panel:#20201e; --ink:#e9e7e1; --muted:#9a988f; --line:#33322e;
+            --del:#ff8a7a; --del-bg:#4a2420; --ins:#7ad99a; --ins-bg:#1d3a26; --pick:#2c2b27; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 system-ui, sans-serif; }
+  header { display:flex; flex-wrap:wrap; gap:8px 16px; align-items:center; padding:10px 16px; border-bottom:1px solid var(--line); }
+  header h1 { font-size:16px; margin:0 8px 0 0; }
+  header label { color:var(--muted); font-size:13px; }
+  select, input { font:inherit; background:var(--panel); color:var(--ink); border:1px solid var(--line); border-radius:4px; padding:2px 6px; }
+  #summary { color:var(--muted); font-size:13px; margin-left:auto; }
+  main { display:grid; grid-template-columns:330px 1fr; height:calc(100vh - 50px); }
+  #list { overflow:auto; border-right:1px solid var(--line); }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th { position:sticky; top:0; background:var(--bg); text-align:left; cursor:pointer; padding:4px 6px; border-bottom:1px solid var(--line); }
+  td { padding:3px 6px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  tr.row { cursor:pointer; }
+  tr.row:hover, tr.row.on { background:var(--pick); }
+  .num { text-align:right; font-variant-numeric:tabular-nums; }
+  .tag { font-size:11px; padding:0 4px; border-radius:3px; border:1px solid var(--line); color:var(--muted); }
+  .better { color:var(--ins); } .worse { color:var(--del); }
+  #detail { display:grid; grid-template-columns:1fr 1fr; min-height:0; }
+  #imgpane { overflow:auto; border-right:1px solid var(--line); background:#0003; }
+  #imgpane img { display:block; width:100%; cursor:zoom-in; }
+  #imgpane.zoom img { width:200%; cursor:zoom-out; }
+  #textpane { overflow:auto; padding:12px 16px; }
+  #meta { color:var(--muted); font-size:13px; margin-bottom:10px; }
+  #diff { font:15px/1.6 ui-serif, Georgia, serif; white-space:normal; overflow-wrap:anywhere; }
+  del { color:var(--del); background:var(--del-bg); text-decoration:line-through; }
+  ins { color:var(--ins); background:var(--ins-bg); text-decoration:none; }
+  .ill { color:var(--muted); background:var(--pick); }
+  .legend { font-size:12px; color:var(--muted); margin:10px 0 0; }
+  @media (max-width: 900px) {
+    main { grid-template-columns:1fr; height:auto; }
+    #list { max-height:40vh; }
+    #detail { grid-template-columns:1fr; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>__TITLE__</h1>
+  <label>Category <select id="cat"><option value="">all</option></select></label>
+  <label>Label <select id="src"><option value="">all</option></select></label>
+  <label>CER ≥ <input id="min" type="number" min="0" max="1" step="0.05" value="0" style="width:64px"></label>
+  <label>Page <input id="q" placeholder="filter id" style="width:120px"></label>
+  <span id="summary"></span>
+</header>
+<main>
+  <div id="list"><table><thead><tr>
+    <th data-k="id">page</th><th data-k="cer" class="num">CER</th><th data-k="base" class="num" id="basecol">Δ</th><th>flags</th>
+  </tr></thead><tbody id="rows"></tbody></table></div>
+  <div id="detail">
+    <div id="imgpane" title="click to zoom"><img id="img" alt=""></div>
+    <div id="textpane">
+      <div id="meta"></div>
+      <div id="diff"></div>
+      <p class="legend"><del>missed or misread (reference)</del> <ins>model output</ins> <span class="ill">#</span> illegible, not scored · j/k next/previous</p>
+    </div>
+  </div>
+</main>
+<script>
+const DATA = __DATA__;
+const pages = DATA.pages;
+const hasBase = pages.some(p => p.base !== undefined);
+const $ = id => document.getElementById(id);
+if (!hasBase) $("basecol").style.display = "none";
+for (const [key, el] of [["cat", $("cat")], ["src", $("src")]]) {
+  for (const v of [...new Set(pages.map(p => p[key]))].sort()) el.add(new Option(v, v));
+}
+let sortKey = "cer", sortDir = -1, shown = [], current = null;
+function filtered() {
+  const cat = $("cat").value, src = $("src").value, min = parseFloat($("min").value) || 0, q = $("q").value.trim();
+  return pages.filter(p => (!cat || p.cat === cat) && (!src || p.src === src) && p.cer >= min && (!q || p.id.includes(q)));
+}
+function mean(xs) { return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0; }
+function render() {
+  shown = filtered().sort((a, b) => {
+    const x = sortKey === "base" ? (a.cer - (a.base ?? a.cer)) : a[sortKey];
+    const y = sortKey === "base" ? (b.cer - (b.base ?? b.cer)) : b[sortKey];
+    return (x < y ? -1 : x > y ? 1 : 0) * sortDir;
+  });
+  const body = $("rows");
+  body.innerHTML = "";
+  for (const p of shown) {
+    const tr = document.createElement("tr");
+    tr.className = "row" + (p === current ? " on" : "");
+    const delta = p.base === undefined ? "" : (p.cer - p.base);
+    const deltaCell = delta === "" ? "" : `<span class="${delta < 0 ? "better" : delta > 0 ? "worse" : ""}">${delta > 0 ? "+" : ""}${delta.toFixed(3)}</span>`;
+    const flags = [p.src === "human" ? "human" : "", p.loop ? "loop" : "", p.retry ? "retry" : ""].filter(Boolean).map(f => `<span class="tag">${f}</span>`).join(" ");
+    tr.innerHTML = `<td>${p.id}</td><td class="num">${p.cer.toFixed(3)}</td>${hasBase ? `<td class="num">${deltaCell}</td>` : ""}<td>${flags}</td>`;
+    tr.onclick = () => show(p);
+    body.appendChild(tr);
+  }
+  let text = `${shown.length} pages · mean CER ${mean(shown.map(p => p.cer)).toFixed(4)}`;
+  if (hasBase) text += ` · baseline ${mean(shown.filter(p => p.base !== undefined).map(p => p.base)).toFixed(4)}`;
+  $("summary").textContent = text;
+  if (!current && shown.length) show(shown[0]);
+}
+function show(p) {
+  current = p;
+  $("img").src = p.img;
+  $("meta").innerHTML = `<b>${p.id}</b> · ${p.cat} · ${p.src} · CER ${p.cer.toFixed(3)}` +
+    (p.base !== undefined ? ` (baseline ${p.base.toFixed(3)})` : "") +
+    ` · ${p.pred_len} predicted / ${p.ref_len} reference chars` + (p.loop ? " · loop cut" : "") + (p.retry ? " · retried" : "");
+  $("diff").innerHTML = p.diff;
+  $("textpane").scrollTop = 0;
+  for (const tr of $("rows").children) tr.classList.toggle("on", tr.firstChild.textContent === p.id);
+  try { history.replaceState(null, "", "#" + p.id); } catch (e) {}
+}
+document.querySelectorAll("th[data-k]").forEach(th => th.onclick = () => {
+  const k = th.dataset.k;
+  sortDir = sortKey === k ? -sortDir : (k === "id" ? 1 : -1);
+  sortKey = k;
+  render();
+});
+for (const id of ["cat", "src", "min", "q"]) $(id).addEventListener("input", render);
+$("imgpane").onclick = () => $("imgpane").classList.toggle("zoom");
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT" || !shown.length) return;
+  const i = shown.indexOf(current);
+  if (e.key === "j") show(shown[Math.min(shown.length - 1, i + 1)]);
+  if (e.key === "k") show(shown[Math.max(0, i - 1)]);
+});
+const start = pages.find(p => "#" + p.id === location.hash);
+if (start) current = start;
+render();
+if (start) show(start);
+</script>
+</body>
+</html>
