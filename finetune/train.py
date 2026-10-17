@@ -255,7 +255,8 @@ def main() -> int:
         config["fold"] = partition["fold"]
     else:
         partition = make_partition(rows, held_ids(Path(config["holdout"])), int(config["seed"]))
-    stages = stage_rows(partition, curriculum)
+    # Eval-only runs train nothing, so a fold may have no training pages.
+    stages = [] if args.eval_only else stage_rows(partition, curriculum)
     for stage in stages:
         for row in stage:
             row["image_path"] = str(image_path(Path(config["data_root"]), row["page_id"]))
