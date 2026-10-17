@@ -35,7 +35,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, help="Stop after this many optimizer steps; useful for smoke tests")
     parser.add_argument("--resume", action="store_true", help="Resume from the latest checkpoint in this run directory")
     parser.add_argument("--evaluate-holdout", action="store_true", help="Score the selected best adapter once on the locked Release 09 holdout")
-    parser.add_argument("--fold", type=Path, help="Leave-one-document-out fold file from finetune.folds; its held-out documents become the development set")
+    parser.add_argument("--fold", type=Path, action="append", help="Leave-one-document-out fold file from finetune.folds; its held-out documents become the development set. With --eval-only it may be repeated")
+    parser.add_argument("--eval-only", action="store_true", help="Score the untrained model (zero-shot) on each --fold's held-out pages, then exit")
     parser.add_argument("--no-wandb", action="store_true")
     return parser.parse_args()
 
@@ -151,9 +152,14 @@ def evaluate(model, processor, rows: list[dict[str, str]], device, config: dict[
     wers: dict[str, list[float]] = defaultdict(list)
     ratios: list[float] = []
     runaways = 0
+    page_scores = []
     for row, pred in zip(rows, preds):
         reference = row["text"]
-        by_category[row["category"]].append(float(metric.page_cer(pred, reference)))
+        page_cer = float(metric.page_cer(pred, reference))
+        page_scores.append({"page_id": row["page_id"], "doc_id": row["doc_id"], "category": row["category"],
+                            "label_source": row["label_source"], "cer": round(page_cer, 4),
+                            "length_ratio": round(len(pred) / max(1, len(reference)), 3)})
+        by_category[row["category"]].append(page_cer)
         wers[row["category"]].append(float(metric.page_wer(pred, reference)))
         ratio = len(pred) / max(1, len(reference))
         ratios.append(ratio)
@@ -164,6 +170,10 @@ def evaluate(model, processor, rows: list[dict[str, str]], device, config: dict[
     result["val_runaway_count"] = float(runaways)
     for category, values in by_category.items():
         result[f"val_cer_{category}"] = float(np.mean(values))
+    with output.with_name(output.stem + "-scores.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(page_scores[0]))
+        writer.writeheader()
+        writer.writerows(page_scores)
     model.train()
     return result
 
@@ -207,7 +217,12 @@ def main() -> int:
     curriculum = resolve_curriculum(config, args.curriculum)
     config["curriculum"] = curriculum["name"]
     config["model_name"] = config.get("model_name", Path(config["model_id"]).name.lower().replace("/", "-"))
-    fold_suffix = f"-fold-{args.fold.stem}" if args.fold else ""
+    folds = args.fold or []
+    if len(folds) > 1 and not args.eval_only:
+        raise SystemExit("training takes one --fold; repeat --fold only with --eval-only")
+    if args.eval_only and not folds:
+        raise SystemExit("--eval-only needs at least one --fold")
+    fold_suffix = "-zeroshot" if args.eval_only else (f"-fold-{folds[0].stem}" if folds else "")
     config["run_id"] = args.run_id or f"{config['model_name']}-{curriculum['name']}-seed{config['seed']}{fold_suffix}"
     run_dir = Path(config["runs_root"]) / config["run_id"]
     requested_world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -230,10 +245,10 @@ def main() -> int:
         cleaned = {record["page_id"]: record["text"] for record in prepare_rows(rows)}
         for row in rows:
             row["target"] = cleaned[row["page_id"]]
-    if args.fold:
+    if folds:
         if args.evaluate_holdout:
             raise SystemExit("--evaluate-holdout and --fold are separate protocols; use one")
-        partition = fold_partition(rows, args.fold)
+        partition = fold_partition(rows, folds[0])
         config["fold"] = partition["fold"]
     else:
         partition = make_partition(rows, held_ids(Path(config["holdout"])), int(config["seed"]))
@@ -256,6 +271,18 @@ def main() -> int:
         write_manifest(run_dir / "manifest.json", partition, curriculum, stages)
     accelerator.wait_for_everyone()
     model, processor = load_model_and_processor(config, accelerator.local_process_index)
+    if args.eval_only:
+        # The LoRA adapter starts at zero, so this scores the base model unchanged.
+        summary = {}
+        for fold_path in folds:
+            fold_rows = [dict(row, image_path=str(image_path(Path(config["data_root"]), row["page_id"])))
+                         for row in fold_partition(rows, fold_path)["development"]]
+            result = evaluate(model, processor, fold_rows, accelerator.device, config, run_dir / "zero_shot" / f"{fold_path.stem}-preds.csv")
+            result["pages"] = len(fold_rows)
+            summary[fold_path.stem] = result
+            print(f"{fold_path.stem}: CER {result['val_macro_cer']:.4f} over {len(fold_rows)} pages", flush=True)
+            (run_dir / "zero_shot" / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return 0
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
     groups = trainable_groups(model, float(config["learning_rate"]), float(config["vision_learning_rate"]))
     try:
