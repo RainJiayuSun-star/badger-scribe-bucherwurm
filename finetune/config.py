@@ -61,6 +61,8 @@ def load_config(path: Path) -> dict[str, Any]:
     config.setdefault("use_cleaned_labels", True)
     # Exclude `#` (illegible in the key) from the loss so the model never learns to emit it.
     config.setdefault("mask_illegible", True)
+    # Stop decoding at a repetition loop and cut it back to its first copy (finetune.loopguard).
+    config.setdefault("loop_guard", True)
     if "model_id" not in config:
         raise ValueError(f"{path} is missing model_id")
     return config

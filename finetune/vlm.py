@@ -148,20 +148,58 @@ def collate_train(rows: list[dict[str, Any]], processor, device, epoch: int, aug
     return {key: value.to(device) if hasattr(value, "to") else value for key, value in batch.items()}
 
 
-def generate_texts(model, processor, rows: list[dict[str, Any]], device, max_new_tokens: int, config: dict[str, Any] | None = None) -> list[str]:
+class LoopStopper:
+    """Stopping criterion: end generation once the output contains a loop.
+
+    Checks every `every` new tokens, so a looping page stops early instead of
+    running to max_new_tokens. Batch size 1, as in generate_texts.
+    """
+
+    def __init__(self, tokenizer, prompt_length: int, every: int = 64):
+        self.tokenizer = tokenizer
+        self.prompt_length = prompt_length
+        self.every = every
+
+    def __call__(self, input_ids, scores, **kwargs):
+        import torch
+
+        from .loopguard import has_loop
+
+        new = input_ids.shape[1] - self.prompt_length
+        stop = new > 0 and new % self.every == 0 and has_loop(
+            self.tokenizer.decode(input_ids[0, self.prompt_length:], skip_special_tokens=True))
+        return torch.full((input_ids.shape[0],), bool(stop), dtype=torch.bool, device=input_ids.device)
+
+
+def generate_texts(model, processor, rows: list[dict[str, Any]], device, max_new_tokens: int, config: dict[str, Any] | None = None) -> tuple[list[str], list[bool]]:
+    """Transcribe each row. Returns the texts and, per page, whether a loop was cut."""
     import torch
+    from transformers import StoppingCriteriaList
+
+    from .loopguard import cut_loops
 
     config = config or {}
     patch = int(config.get("image_patch_size", 14))
+    guard = bool(config.get("loop_guard", True))
     outputs: list[str] = []
+    cut_flags: list[bool] = []
     for row in rows:
         item = messages(row["image_path"], None, max_pixels_for(config, row.get("category")))
         text = processor.apply_chat_template(item, tokenize=False, add_generation_prompt=True)
         images, videos = _vision_inputs([item], patch)
         inputs = processor(text=[text], images=images, videos=videos, padding=True, return_tensors="pt")
         inputs = {key: value.to(device) if hasattr(value, "to") else value for key, value in inputs.items()}
+        extra = {}
+        if guard:
+            extra["stopping_criteria"] = StoppingCriteriaList([LoopStopper(processor.tokenizer, inputs["input_ids"].shape[1])])
         with torch.inference_mode():
-            generated = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+            generated = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False, **extra)
         trimmed = [ids[len(source):] for source, ids in zip(inputs["input_ids"], generated)]
-        outputs.extend(processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False))
-    return outputs
+        decoded = processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+        if guard:
+            decoded, was_cut = cut_loops(decoded)
+        else:
+            was_cut = False
+        outputs.append(decoded)
+        cut_flags.append(was_cut)
+    return outputs, cut_flags
