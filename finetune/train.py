@@ -268,6 +268,10 @@ def main() -> int:
         total_steps = min(total_steps, args.max_steps)
     scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=max(1, int(total_steps * float(config["warmup_ratio"]))), num_training_steps=total_steps)
     model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
+    # from_pretrained returns the model in eval mode, where gradient checkpointing
+    # and LoRA dropout are inactive. Without this the first epoch used about 2.4x
+    # the GPU memory (26.5 GB vs 10.9 GB for one Churro-3B page in bf16).
+    model.train()
     augmenter = OCRAugmenter(profile, int(config["seed"]))
     writer = MetricWriter(run_dir, not args.no_wandb and accelerator.is_main_process, config, accelerator) if accelerator.is_main_process else None
     global_step = 0
