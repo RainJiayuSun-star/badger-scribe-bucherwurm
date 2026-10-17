@@ -22,6 +22,7 @@ import numpy as np
 
 from .augmentation import OCRAugmenter, load_profile
 from .config import load_config, resolve_curriculum, resolved_config_json
+from .prep import prepare_rows
 from .data import fold_partition, image_path, held_ids, make_partition, read_rows, selected_rows, write_manifest
 from .vlm import collate_train, generate_texts, load_model_and_processor
 
@@ -144,7 +145,7 @@ def evaluate(model, processor, rows: list[dict[str, str]], device, config: dict[
     assert spec and spec.loader
     spec.loader.exec_module(metric)
     model.eval()
-    preds = generate_texts(model, processor, rows, device, int(config.get("eval_max_new_tokens", 2048)))
+    preds = generate_texts(model, processor, rows, device, int(config.get("eval_max_new_tokens", 2048)), config)
     write_predictions(output, rows, preds)
     by_category: dict[str, list[float]] = defaultdict(list)
     wers: dict[str, list[float]] = defaultdict(list)
@@ -165,6 +166,18 @@ def evaluate(model, processor, rows: list[dict[str, str]], device, config: dict[
         result[f"val_cer_{category}"] = float(np.mean(values))
     model.train()
     return result
+
+
+def trainable_groups(model, language_lr: float, vision_lr: float) -> list[dict[str, Any]]:
+    """Vision-tower adapters get vision_learning_rate; everything else learning_rate."""
+    vision, other = [], []
+    for name, parameter in model.named_parameters():
+        if parameter.requires_grad:
+            (vision if (".visual." in name or name.startswith("visual.")) and "merger" not in name else other).append(parameter)
+    groups = [{"params": other, "lr": language_lr}]
+    if vision:
+        groups.append({"params": vision, "lr": vision_lr})
+    return groups
 
 
 def stage_rows(partition: dict[str, Any], curriculum: dict[str, Any]) -> list[list[dict[str, str]]]:
@@ -212,6 +225,11 @@ def main() -> int:
     seed_everything(int(config["seed"]))
 
     rows = read_rows(Path(config["data_root"]))
+    if config.get("use_cleaned_labels", True):
+        # "target" is what the model learns; "text" stays the original key for scoring.
+        cleaned = {record["page_id"]: record["text"] for record in prepare_rows(rows)}
+        for row in rows:
+            row["target"] = cleaned[row["page_id"]]
     if args.fold:
         if args.evaluate_holdout:
             raise SystemExit("--evaluate-holdout and --fold are separate protocols; use one")
@@ -239,10 +257,11 @@ def main() -> int:
     accelerator.wait_for_everyone()
     model, processor = load_model_and_processor(config, accelerator.local_process_index)
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    groups = trainable_groups(model, float(config["learning_rate"]), float(config["vision_learning_rate"]))
     try:
-        optimizer = AdamW(trainable, lr=float(config["learning_rate"]), fused=True)
+        optimizer = AdamW(groups, fused=True)
     except (TypeError, RuntimeError):
-        optimizer = AdamW(trainable, lr=float(config["learning_rate"]))
+        optimizer = AdamW(groups)
     total_batches = sum(math.ceil(len(stage) / int(config["per_device_batch_size"])) for stage in stages)
     total_steps = max(1, math.ceil(total_batches * int(config["epochs"]) / grad_accum))
     if args.max_steps:
@@ -277,7 +296,7 @@ def main() -> int:
                 loader = DataLoader(rows_for_stage, batch_size=int(config["per_device_batch_size"]), shuffle=True, collate_fn=lambda items: items)
                 loader = accelerator.prepare(loader)
                 for raw_batch in loader:
-                    batch = collate_train(raw_batch, processor, accelerator.device, epoch, augmenter)
+                    batch = collate_train(raw_batch, processor, accelerator.device, epoch, augmenter, config)
                     with accelerator.accumulate(model):
                         output = model(**batch)
                         accelerator.backward(output.loss)

@@ -49,6 +49,18 @@ def load_config(path: Path) -> dict[str, Any]:
     config.setdefault("augmentation_profile", str(ROOT / "finetune" / "augmentation" / "default.yaml"))
     config.setdefault("adapter_policy", "language_projector")
     config.setdefault("wandb_project", "badger-scribe-finetune")
+    # Image budget per page. One image token covers (patch * 2)^2 pixels, so at
+    # patch 14 the default of 1280 tokens is about 1.0 MP, matching the benchmark.
+    config.setdefault("image_patch_size", 14)
+    config.setdefault("max_pixels", 1280 * 28 * 28)
+    config.setdefault("max_pixels_by_category", {})
+    # "4bit" (QLoRA, NF4) or "none" (bf16 LoRA; a 3B-4B model fits a 24 GB A5000).
+    config.setdefault("quantization", "4bit")
+    # Train on finetune.prep's cleaned labels (Postmark lines removed); scoring
+    # always uses the original keys.
+    config.setdefault("use_cleaned_labels", True)
+    # Exclude `#` (illegible in the key) from the loss so the model never learns to emit it.
+    config.setdefault("mask_illegible", True)
     if "model_id" not in config:
         raise ValueError(f"{path} is missing model_id")
     return config
