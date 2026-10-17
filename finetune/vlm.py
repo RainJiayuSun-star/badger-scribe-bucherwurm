@@ -171,35 +171,64 @@ class LoopStopper:
         return torch.full((input_ids.shape[0],), bool(stop), dtype=torch.bool, device=input_ids.device)
 
 
-def generate_texts(model, processor, rows: list[dict[str, Any]], device, max_new_tokens: int, config: dict[str, Any] | None = None) -> tuple[list[str], list[bool]]:
-    """Transcribe each row. Returns the texts and, per page, whether a loop was cut."""
+def _decode_once(model, processor, inputs, max_new_tokens: int, guard: bool, temperature: float | None) -> str:
     import torch
     from transformers import StoppingCriteriaList
+
+    extra: dict[str, Any] = {}
+    if guard:
+        extra["stopping_criteria"] = StoppingCriteriaList([LoopStopper(processor.tokenizer, inputs["input_ids"].shape[1])])
+    if temperature:
+        extra.update(do_sample=True, temperature=temperature, top_p=1.0)
+    else:
+        extra["do_sample"] = False
+    with torch.inference_mode():
+        generated = model.generate(**inputs, max_new_tokens=max_new_tokens, **extra)
+    trimmed = [ids[len(source):] for source, ids in zip(inputs["input_ids"], generated)]
+    return processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+
+
+def generate_texts(model, processor, rows: list[dict[str, Any]], device, max_new_tokens: int, config: dict[str, Any] | None = None) -> tuple[list[str], list[dict[str, int]]]:
+    """Transcribe each row greedily. Returns the texts and per-page decode info.
+
+    With the loop guard on, a looping output is cut back to its first copy. If
+    `loop_retry_temperatures` is set, a page whose greedy output looped, or came
+    out nearly empty, is decoded again with sampling at each temperature in turn;
+    the first retry that neither loops nor comes out nearly empty is used, and
+    otherwise the cut greedy output is kept. Sampling is seeded per page.
+    """
+    import hashlib
+
+    import torch
 
     from .loopguard import cut_loops
 
     config = config or {}
     patch = int(config.get("image_patch_size", 14))
     guard = bool(config.get("loop_guard", True))
+    temperatures = [float(t) for t in config.get("loop_retry_temperatures") or []]
+    min_chars = int(config.get("retry_min_chars", 40))
     outputs: list[str] = []
-    cut_flags: list[bool] = []
+    infos: list[dict[str, int]] = []
     for row in rows:
         item = messages(row["image_path"], None, max_pixels_for(config, row.get("category")))
         text = processor.apply_chat_template(item, tokenize=False, add_generation_prompt=True)
         images, videos = _vision_inputs([item], patch)
         inputs = processor(text=[text], images=images, videos=videos, padding=True, return_tensors="pt")
         inputs = {key: value.to(device) if hasattr(value, "to") else value for key, value in inputs.items()}
-        extra = {}
+        decoded = _decode_once(model, processor, inputs, max_new_tokens, guard, None)
+        looped = False
         if guard:
-            extra["stopping_criteria"] = StoppingCriteriaList([LoopStopper(processor.tokenizer, inputs["input_ids"].shape[1])])
-        with torch.inference_mode():
-            generated = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False, **extra)
-        trimmed = [ids[len(source):] for source, ids in zip(inputs["input_ids"], generated)]
-        decoded = processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        if guard:
-            decoded, was_cut = cut_loops(decoded)
-        else:
-            was_cut = False
+            decoded, looped = cut_loops(decoded)
+        info = {"loop_cut": int(looped), "retry_used": 0}
+        if temperatures and (looped or len(decoded.strip()) < min_chars):
+            seed = int(hashlib.sha256(row["page_id"].encode()).hexdigest()[:8], 16)
+            for attempt, temperature in enumerate(temperatures, start=1):
+                torch.manual_seed(seed + attempt)
+                candidate, candidate_looped = cut_loops(_decode_once(model, processor, inputs, max_new_tokens, guard, temperature))
+                if not candidate_looped and len(candidate.strip()) >= min_chars:
+                    decoded, info["retry_used"] = candidate, attempt
+                    break
         outputs.append(decoded)
-        cut_flags.append(was_cut)
-    return outputs, cut_flags
+        infos.append(info)
+    return outputs, infos

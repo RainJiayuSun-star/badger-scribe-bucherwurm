@@ -69,3 +69,55 @@ class LoopStopperTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(HAS_TORCH, "torch is installed by the cuda extra")
+class RetryTests(unittest.TestCase):
+    LOOP = "Lieber Sohn!\n" + "Ed. u. H. zu Hause\nIhr\n" * 20
+    GOOD = "Lieber Sohn! Wir sind alle gesund und es geht uns gut."
+
+    def run_pages(self, outputs, config):
+        import torch
+        from unittest import mock
+
+        from finetune import vlm
+
+        class Processor:
+            tokenizer = None
+
+            def apply_chat_template(self, *args, **kwargs):
+                return ""
+
+            def __call__(self, **kwargs):
+                return {"input_ids": torch.zeros((1, 3), dtype=torch.long)}
+
+        calls = []
+
+        def fake_decode(model, processor, inputs, max_new_tokens, guard, temperature):
+            calls.append(temperature)
+            return outputs.pop(0)
+
+        with mock.patch.object(vlm, "_vision_inputs", return_value=(None, None)), \
+                mock.patch.object(vlm, "_decode_once", side_effect=fake_decode):
+            texts, infos = vlm.generate_texts(None, Processor(), [{"page_id": "p1", "image_path": "x.jpg"}], "cpu", 10, config)
+        return texts[0], infos[0], calls
+
+    def test_off_by_default_keeps_the_cut_greedy_output(self):
+        text, info, calls = self.run_pages([self.LOOP], {})
+        self.assertEqual(calls, [None])
+        self.assertEqual(info, {"loop_cut": 1, "retry_used": 0})
+        self.assertTrue(text.endswith("Ihr"))
+
+    def test_first_clean_retry_is_used(self):
+        text, info, calls = self.run_pages([self.LOOP, self.LOOP, self.GOOD], {"loop_retry_temperatures": [0.3, 0.6]})
+        self.assertEqual(calls, [None, 0.3, 0.6])
+        self.assertEqual(text, self.GOOD)
+        self.assertEqual(info["retry_used"], 2)
+
+    def test_near_empty_output_is_retried(self):
+        text, info, _ = self.run_pages(["Lie", self.GOOD], {"loop_retry_temperatures": [0.3]})
+        self.assertEqual((text, info["retry_used"]), (self.GOOD, 1))
+
+    def test_clean_greedy_output_is_not_retried(self):
+        _, info, calls = self.run_pages([self.GOOD], {"loop_retry_temperatures": [0.3]})
+        self.assertEqual((calls, info["retry_used"]), ([None], 0))

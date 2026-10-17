@@ -146,20 +146,20 @@ def evaluate(model, processor, rows: list[dict[str, str]], device, config: dict[
     assert spec and spec.loader
     spec.loader.exec_module(metric)
     model.eval()
-    preds, loop_cuts = generate_texts(model, processor, rows, device, int(config.get("eval_max_new_tokens", 2048)), config)
+    preds, decode_info = generate_texts(model, processor, rows, device, int(config.get("eval_max_new_tokens", 2048)), config)
     write_predictions(output, rows, preds)
     by_category: dict[str, list[float]] = defaultdict(list)
     wers: dict[str, list[float]] = defaultdict(list)
     ratios: list[float] = []
     runaways = 0
     page_scores = []
-    for row, pred, was_cut in zip(rows, preds, loop_cuts):
+    for row, pred, info in zip(rows, preds, decode_info):
         reference = row["text"]
         page_cer = float(metric.page_cer(pred, reference))
         page_scores.append({"page_id": row["page_id"], "doc_id": row["doc_id"], "category": row["category"],
                             "label_source": row["label_source"], "cer": round(page_cer, 4),
                             "length_ratio": round(len(pred) / max(1, len(reference)), 3),
-                            "loop_cut": int(was_cut)})
+                            "loop_cut": info["loop_cut"], "retry_used": info["retry_used"]})
         by_category[row["category"]].append(page_cer)
         wers[row["category"]].append(float(metric.page_wer(pred, reference)))
         ratio = len(pred) / max(1, len(reference))
@@ -169,7 +169,8 @@ def evaluate(model, processor, rows: list[dict[str, str]], device, config: dict[
     result["val_wer"] = float(np.mean([value for values in wers.values() for value in values]))
     result["val_length_ratio"] = float(np.mean(ratios))
     result["val_runaway_count"] = float(runaways)
-    result["val_loop_cuts"] = float(sum(loop_cuts))
+    result["val_loop_cuts"] = float(sum(info["loop_cut"] for info in decode_info))
+    result["val_retries_used"] = float(sum(bool(info["retry_used"]) for info in decode_info))
     for category, values in by_category.items():
         result[f"val_cer_{category}"] = float(np.mean(values))
     with output.with_name(output.stem + "-scores.csv").open("w", newline="", encoding="utf-8") as handle:

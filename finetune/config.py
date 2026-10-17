@@ -63,6 +63,9 @@ def load_config(path: Path) -> dict[str, Any]:
     config.setdefault("mask_illegible", True)
     # Stop decoding at a repetition loop and cut it back to its first copy (finetune.loopguard).
     config.setdefault("loop_guard", True)
+    # Off by default: re-decode looping or near-empty pages with sampling at these temperatures.
+    config.setdefault("loop_retry_temperatures", [])
+    config.setdefault("retry_min_chars", 40)
     if "model_id" not in config:
         raise ValueError(f"{path} is missing model_id")
     return config
