@@ -12,6 +12,7 @@ import math
 import os
 import platform
 import random
+import shutil
 import subprocess
 import time
 from collections import defaultdict
@@ -193,13 +194,39 @@ def trainable_groups(model, language_lr: float, vision_lr: float) -> list[dict[s
     return groups
 
 
-def stage_rows(partition: dict[str, Any], curriculum: dict[str, Any]) -> list[list[dict[str, str]]]:
-    return [selected_rows(partition, stage, "train") for stage in curriculum["stages"]]
+def stage_rows(partition: dict[str, Any], curriculum: dict[str, Any], human_repeats: int = 1) -> list[list[dict[str, str]]]:
+    stages = []
+    for stage in curriculum["stages"]:
+        rows = []
+        for row in selected_rows(partition, stage, "train"):
+            rows += [row] * (human_repeats if row["label_source"] == "human" else 1)
+        stages.append(rows)
+    return stages
 
 
-def latest_checkpoint(run_dir: Path) -> Path | None:
-    checkpoints = sorted(run_dir.glob("checkpoint-*"), key=lambda path: int(path.name.rsplit("-", 1)[-1]))
+def checkpoints_by_step(directory: Path) -> list[Path]:
+    return sorted(directory.glob("checkpoint-*"), key=lambda path: int(path.name.rsplit("-", 1)[-1]))
+
+
+def latest_checkpoint(directory: Path) -> Path | None:
+    checkpoints = checkpoints_by_step(directory)
     return checkpoints[-1] if checkpoints else None
+
+
+def checkpoint_dir(config: dict[str, Any], run_dir: Path) -> Path:
+    """Where resume checkpoints go. Everything else stays in run_dir."""
+    root = config.get("checkpoint_root")
+    return Path(root) / config["run_id"] if root else run_dir
+
+
+def prune_checkpoints(directory: Path, keep: int) -> list[Path]:
+    """Delete the oldest checkpoints so at most `keep` remain (0 keeps all). Returns what was removed."""
+    if keep <= 0:
+        return []
+    removed = checkpoints_by_step(directory)[:-keep]
+    for path in removed:
+        shutil.rmtree(path)
+    return removed
 
 
 def main() -> int:
@@ -256,7 +283,7 @@ def main() -> int:
     else:
         partition = make_partition(rows, held_ids(Path(config["holdout"])), int(config["seed"]))
     # Eval-only runs train nothing, so a fold may have no training pages.
-    stages = [] if args.eval_only else stage_rows(partition, curriculum)
+    stages = [] if args.eval_only else stage_rows(partition, curriculum, int(config["human_repeats"]))
     for stage in stages:
         for row in stage:
             row["image_path"] = str(image_path(Path(config["data_root"]), row["page_id"]))
@@ -308,8 +335,9 @@ def main() -> int:
     global_step = 0
     resume_stage = 0
     resume_stage_epoch = 0
+    checkpoints_root = checkpoint_dir(config, run_dir)
     if args.resume:
-        checkpoint = latest_checkpoint(run_dir)
+        checkpoint = latest_checkpoint(checkpoints_root)
         if checkpoint:
             accelerator.load_state(checkpoint)
             state_path = checkpoint / "state.json"
@@ -371,10 +399,12 @@ def main() -> int:
                         unwrapped.save_pretrained(run_dir / "best_adapter")
                         processor.save_pretrained(run_dir / "best_adapter")
                 accelerator.wait_for_everyone()
-                checkpoint = run_dir / f"checkpoint-{global_step}"
+                checkpoint = checkpoints_root / f"checkpoint-{global_step}"
                 accelerator.save_state(checkpoint)
                 if accelerator.is_main_process:
                     (checkpoint / "state.json").write_text(json.dumps({"global_step": global_step, "epoch": epoch + 1, "stage": stage_index + 1, "stage_epoch": stage_epoch + 1}) + "\n", encoding="utf-8")
+                    # Oldest go first, and only after the new checkpoint is fully written.
+                    prune_checkpoints(checkpoints_root, int(config["keep_checkpoints"]))
                 accelerator.wait_for_everyone()
                 if global_step >= total_steps:
                     break
