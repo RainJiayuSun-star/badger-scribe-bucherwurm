@@ -70,12 +70,13 @@ def load_config(path: Path) -> dict[str, Any]:
     # train pages are mostly unreviewed drafts, so this tilts training toward the
     # reviewed ones. Training only; inference never sees label_source.
     config.setdefault("human_repeats", 1)
-    # Resume checkpoints hold the full model state (about 7.4 GB for Churro-3B).
-    # checkpoint_root puts them on a scratch disk while metrics, predictions and
-    # best_adapter stay in runs_root; keep_checkpoints deletes the oldest beyond
-    # this many (0 keeps all).
+    # Resume checkpoints hold only what training changes (about 0.4 GB for
+    # Churro-3B at rank 16; see finetune/checkpoints.py), so by default they sit
+    # in the run directory on persistent storage. keep_checkpoints is a FIFO:
+    # after a new one is complete, the oldest beyond this many are deleted
+    # (0 keeps all). checkpoint_root moves them elsewhere.
     config.setdefault("checkpoint_root", None)
-    config.setdefault("keep_checkpoints", 0)
+    config.setdefault("keep_checkpoints", 2)
     if "model_id" not in config:
         raise ValueError(f"{path} is missing model_id")
     return config

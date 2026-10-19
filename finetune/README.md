@@ -89,19 +89,47 @@ length ratio and whether the loop guard fired, so bad pages are easy to find.
 | `human_repeats` | 1 | Repeat each human-labeled training page this many times per epoch (training only) |
 | `loop_guard` | true | Stop decoding at a repetition loop and keep its first copy (`finetune/loopguard.py`) |
 | `loop_retry_temperatures` | `[]` | If set, re-decode looping or near-empty pages with sampling at these temperatures |
-| `checkpoint_root` | run directory | Where resume checkpoints go (about 7.4 GB each for Churro-3B). Metrics, predictions and `best_adapter` always stay in `runs_root` |
-| `keep_checkpoints` | 0 (all) | Keep only the newest N checkpoints; the oldest is deleted after a new one is written |
+| `keep_checkpoints` | 2 | FIFO: after a new resume checkpoint is complete, delete the oldest beyond N (0 keeps all) |
+| `checkpoint_root` | run directory | Put resume checkpoints somewhere other than the run directory |
 
 No option reads `label_source` at inference time; the competition forbids
 behaving differently on silver-labelled pages.
+
+## Checkpoints and run diagnostics
+
+After each epoch the run saves a resume checkpoint holding only what training
+changes: the LoRA weights, optimizer and scheduler state and random-number
+state (about 0.4 GB for Churro-3B, not the 7.4 GB of a full model). It is
+written under a temporary name and renamed when complete, and only then are
+older ones deleted, so the last complete epoch is always on disk. If the disk
+lacks room, the checkpoint is skipped with a warning and training continues.
+`--resume` with the same `--run-id` continues from the newest one.
+
+Every run also writes two files to its run directory for diagnosing a run
+that stopped:
+
+- `status.json`: the current phase (`loading_model`, `training`, `evaluating`,
+  `saving_checkpoint`, `finished`, `failed`), step, epoch, page within an
+  evaluation, and RAM, GPU memory and free disk at the last update.
+- `events.jsonl`: one line per event (each phase, evaluation score, checkpoint
+  saved or skipped, signal received, crash with traceback).
+
+How to read the last line of `events.jsonl`:
+
+| Last event | Meaning |
+| --- | --- |
+| `finished` | The run completed |
+| `failed` | Python error; the `traceback` field says where |
+| `signal` (SIGTERM) | Stopped from outside, for example the workspace was shut down or evicted |
+| anything else | Killed without warning (out of memory, node failure); `status.json` shows where it was |
 
 ## EFabric notes
 
 - `uv` is at `/opt/conda/bin/uv` and is not on the PATH of a non-interactive SSH command.
 - The home directory is JuiceFS, so the first import of torch and transformers takes a few minutes.
-- The home directory has a 64 GB quota, which three Churro checkpoints nearly fill. Add
-  `checkpoint_root: /tmp/badger-checkpoints` and `keep_checkpoints: 2` to the config so
-  checkpoints go to the workspace's local disk (lost when the workspace ends) and results stay in home.
+- The home directory has a 64 GB quota; keep checkpoints there (the default). Do not
+  point `checkpoint_root` at `/tmp`: writing about 15 GB there got two workspaces
+  restarted, most likely by the pod's ephemeral-storage limit.
 - `scp` does not work on the workspace; copy single files with `ssh host 'cat > path' < path`.
 
 After locking a candidate on the human development set, score it once on the

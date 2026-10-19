@@ -188,8 +188,11 @@ def _decode_once(model, processor, inputs, max_new_tokens: int, guard: bool, tem
     return processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
 
 
-def generate_texts(model, processor, rows: list[dict[str, Any]], device, max_new_tokens: int, config: dict[str, Any] | None = None) -> tuple[list[str], list[dict[str, int]]]:
+def generate_texts(model, processor, rows: list[dict[str, Any]], device, max_new_tokens: int, config: dict[str, Any] | None = None,
+                   on_page=None) -> tuple[list[str], list[dict[str, int]]]:
     """Transcribe each row greedily. Returns the texts and per-page decode info.
+
+    `on_page(done, total)`, if given, is called after each page (progress reporting).
 
     With the loop guard on, a looping output is cut back to its first copy. If
     `loop_retry_temperatures` is set, a page whose greedy output looped, or came
@@ -231,4 +234,6 @@ def generate_texts(model, processor, rows: list[dict[str, Any]], device, max_new
                     break
         outputs.append(decoded)
         infos.append(info)
+        if on_page:
+            on_page(len(outputs), len(rows))
     return outputs, infos

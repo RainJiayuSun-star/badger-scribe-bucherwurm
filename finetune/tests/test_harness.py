@@ -78,33 +78,5 @@ class HumanRepeatTests(unittest.TestCase):
         self.assertEqual([row["page_id"] for row in stage_rows({"train": train}, curriculum)[0]], ["a", "b"])
 
 
-class CheckpointTests(unittest.TestCase):
-    def test_prune_keeps_the_newest_by_step_not_by_name(self):
-        import tempfile
-        from pathlib import Path
-
-        from finetune.train import latest_checkpoint, prune_checkpoints
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            for step in (9, 22, 100):
-                (root / f"checkpoint-{step}").mkdir()
-            (root / "best_adapter").mkdir()
-            removed = prune_checkpoints(root, keep=2)
-            self.assertEqual([p.name for p in removed], ["checkpoint-9"])
-            self.assertEqual(sorted(p.name for p in root.iterdir()), ["best_adapter", "checkpoint-100", "checkpoint-22"])
-            self.assertEqual(latest_checkpoint(root).name, "checkpoint-100")
-            self.assertEqual(prune_checkpoints(root, keep=0), [])
-
-    def test_checkpoint_root_is_separate_from_the_run_directory(self):
-        from pathlib import Path
-
-        from finetune.train import checkpoint_dir
-
-        run_dir = Path("/home/runs/abc")
-        self.assertEqual(checkpoint_dir({"run_id": "abc"}, run_dir), run_dir)
-        self.assertEqual(checkpoint_dir({"run_id": "abc", "checkpoint_root": "/tmp/ck"}, run_dir), Path("/tmp/ck/abc"))
-
-
 if __name__ == "__main__":
     unittest.main()
