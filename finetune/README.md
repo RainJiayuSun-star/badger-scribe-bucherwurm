@@ -91,6 +91,7 @@ length ratio and whether the loop guard fired, so bad pages are easy to find.
 | `loop_retry_temperatures` | `[]` | If set, re-decode looping or near-empty pages with sampling at these temperatures |
 | `keep_checkpoints` | 2 | FIFO: after a new resume checkpoint is complete, delete the oldest beyond N (0 keeps all) |
 | `checkpoint_root` | run directory | Put resume checkpoints somewhere other than the run directory |
+| `min_free_disk_gib`, `min_free_gpu_gib` | 2, 12 | Preflight thresholds; 0 turns a check off |
 
 No option reads `label_source` at inference time; the competition forbids
 behaving differently on silver-labelled pages.
@@ -113,6 +114,18 @@ that stopped:
   evaluation, and RAM, GPU memory and free disk at the last update.
 - `events.jsonl`: one line per event (each phase, evaluation score, checkpoint
   saved or skipped, signal received, crash with traceback).
+
+`python -m finetune.status` lists every run with its best score and how it
+ended; `python -m finetune.status <run-id>` shows one run's position, scores
+per epoch, last resource snapshot, recent events and, after a crash, the end of
+the traceback.
+
+Before loading the model, a run checks that the data is in place, that the run
+and checkpoint directories have `min_free_disk_gib` free, that the GPU has
+`min_free_gpu_gib` free, that the same run is not already running, and that it
+would not start over on top of existing checkpoints without `--resume`. If
+anything fails it exits before doing any work and lists every problem (above
+accelerate's own traceback).
 
 How to read the last line of `events.jsonl`:
 

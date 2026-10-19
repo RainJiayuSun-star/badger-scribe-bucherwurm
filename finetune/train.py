@@ -23,6 +23,7 @@ import numpy as np
 from .augmentation import OCRAugmenter, load_profile
 from .checkpoints import (DISK_MARGIN_BYTES, checkpoint_dir, disk_free, estimate_bytes, latest_checkpoint,
                           load_checkpoint, prune_checkpoints, save_checkpoint)
+from .preflight import run_checks
 from .runstate import Heartbeat, RunState
 from .config import load_config, resolve_curriculum, resolved_config_json
 from .prep import prepare_rows
@@ -304,12 +305,13 @@ def run(args: argparse.Namespace, holder: dict[str, RunState]) -> int:
     config["augmentation_profile"] = str(profile_path)
     config["augmentation"] = profile
 
+    checkpoints_root = checkpoint_dir(config, run_dir)
+    run_checks(config, run_dir, checkpoints_root, args.resume, args.eval_only)
     if accelerator.is_main_process:
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "config.json").write_text(resolved_config_json(config), encoding="utf-8")
         (run_dir / "environment.json").write_text(json.dumps(version_info(), indent=2) + "\n", encoding="utf-8")
         write_manifest(run_dir / "manifest.json", partition, curriculum, stages)
-    checkpoints_root = checkpoint_dir(config, run_dir)
     state = RunState(run_dir, {"run_dir": run_dir, "checkpoints": checkpoints_root}, enabled=accelerator.is_main_process)
     holder["state"] = state
     state.catch_signals()

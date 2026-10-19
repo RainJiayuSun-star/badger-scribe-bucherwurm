@@ -77,6 +77,11 @@ def load_config(path: Path) -> dict[str, Any]:
     # (0 keeps all). checkpoint_root moves them elsewhere.
     config.setdefault("checkpoint_root", None)
     config.setdefault("keep_checkpoints", 2)
+    # Preflight (finetune/preflight.py): refuse to start below these. Two
+    # checkpoints, best_adapter and predictions take about 1 GiB; a Churro-3B
+    # bf16 run peaks at 12-16 GiB of GPU memory. 0 turns a check off.
+    config.setdefault("min_free_disk_gib", 2.0)
+    config.setdefault("min_free_gpu_gib", 12.0)
     if "model_id" not in config:
         raise ValueError(f"{path} is missing model_id")
     return config
