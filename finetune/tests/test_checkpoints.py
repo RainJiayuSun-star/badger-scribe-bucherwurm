@@ -1,0 +1,241 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import signal
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from finetune.checkpoints import checkpoints_by_step, latest_checkpoint, prune_checkpoints
+from finetune.runstate import Heartbeat, RunState
+
+HAS_TORCH = importlib.util.find_spec("torch") is not None and importlib.util.find_spec("safetensors") is not None
+
+
+def _fake_checkpoint(root: Path, step: int) -> None:
+    (root / f"checkpoint-{step}").mkdir()
+    (root / f"checkpoint-{step}" / "state.json").write_text("{}")
+
+
+class FifoTests(unittest.TestCase):
+    def test_prune_keeps_the_newest_by_step_not_by_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for step in (9, 22, 100):
+                _fake_checkpoint(root, step)
+            (root / "best_adapter").mkdir()
+            removed = prune_checkpoints(root, keep=2)
+            self.assertEqual([p.name for p in removed], ["checkpoint-9"])
+            self.assertEqual(sorted(p.name for p in root.iterdir()), ["best_adapter", "checkpoint-100", "checkpoint-22"])
+            self.assertEqual(latest_checkpoint(root).name, "checkpoint-100")
+            self.assertEqual(prune_checkpoints(root, keep=0), [])
+
+    def test_partial_and_unfinished_checkpoints_are_never_counted_or_pruned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _fake_checkpoint(root, 10)
+            (root / "partial-checkpoint-20").mkdir()       # killed mid-save
+            (root / "checkpoint-30").mkdir()               # no state.json: incomplete
+            self.assertEqual([p.name for p in checkpoints_by_step(root)], ["checkpoint-10"])
+            self.assertEqual(prune_checkpoints(root, keep=1), [])
+            self.assertEqual(latest_checkpoint(root).name, "checkpoint-10")
+
+
+@unittest.skipUnless(HAS_TORCH, "torch and safetensors are installed by the cuda extra")
+class RoundTripTests(unittest.TestCase):
+    def _setup(self):
+        import torch
+
+        model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 2))
+        model[0].weight.requires_grad_(False)       # a frozen "base" weight
+        optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=0.1)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.5)
+        return model, optimizer, scheduler
+
+    def _step(self, model, optimizer, scheduler):
+        import torch
+
+        loss = model(torch.ones(3, 4)).pow(2).sum()
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+
+    def test_resume_continues_exactly_where_training_stopped(self):
+        import torch
+
+        from finetune.checkpoints import load_checkpoint, save_checkpoint
+
+        torch.manual_seed(0)
+        model, optimizer, scheduler = self._setup()
+        self._step(model, optimizer, scheduler)
+        with tempfile.TemporaryDirectory() as tmp:
+            path, size = save_checkpoint(Path(tmp), 1, model, optimizer, scheduler, {"global_step": 1, "best_cer": 0.2})
+            self.assertEqual(path.name, "checkpoint-1")
+            self.assertFalse((Path(tmp) / "partial-checkpoint-1").exists())
+            self.assertGreater(size, 0)
+            self._step(model, optimizer, scheduler)
+            expected = [p.detach().clone() for p in model.parameters()]
+
+            torch.manual_seed(123)
+            fresh, fresh_optimizer, fresh_scheduler = self._setup()
+            with torch.no_grad():
+                fresh[0].weight.copy_(model[0].weight)      # the frozen base comes from the pretrained model
+            saved = load_checkpoint(path, fresh, fresh_optimizer, fresh_scheduler)
+            self.assertEqual(saved["best_cer"], 0.2)
+            self._step(fresh, fresh_optimizer, fresh_scheduler)
+        for got, want in zip(fresh.parameters(), expected):
+            self.assertTrue(torch.allclose(got, want))
+
+    def test_only_trainable_tensors_are_saved(self):
+        from safetensors.torch import load_file
+
+        from finetune.checkpoints import save_checkpoint
+
+        model, optimizer, scheduler = self._setup()
+        with tempfile.TemporaryDirectory() as tmp:
+            path, _ = save_checkpoint(Path(tmp), 5, model, optimizer, scheduler, {})
+            self.assertEqual(sorted(load_file(str(path / "trainable.safetensors"))), ["0.bias", "1.bias", "1.weight"])
+
+
+@unittest.skipUnless(HAS_TORCH, "torch and safetensors are installed by the cuda extra")
+class WriteFailureTests(unittest.TestCase):
+    def _setup(self):
+        import torch
+
+        model = torch.nn.Linear(2, 2)
+        optimizer = torch.optim.AdamW(model.parameters())
+        return model, optimizer, torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+
+    def test_a_full_disk_becomes_oserror_and_leaves_no_partial_files(self):
+        from safetensors import SafetensorError
+
+        from finetune.checkpoints import save_checkpoint
+
+        # What a full disk really raises: not OSError, from either writer.
+        for target, error in (("safetensors.torch.save_file", SafetensorError("Disk quota exceeded")),
+                              ("torch.save", RuntimeError("file write failed"))):
+            with self.subTest(target), tempfile.TemporaryDirectory() as tmp, mock.patch(target, side_effect=error):
+                with self.assertRaises(OSError):
+                    save_checkpoint(Path(tmp), 1, *self._setup(), {})
+                self.assertEqual(list(Path(tmp).iterdir()), [])
+
+    def test_a_leftover_partial_checkpoint_is_cleared_by_the_next_save(self):
+        from finetune.checkpoints import save_checkpoint
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "partial-checkpoint-3").mkdir()
+            save_checkpoint(Path(tmp), 4, *self._setup(), {})
+            self.assertEqual([p.name for p in Path(tmp).iterdir()], ["checkpoint-4"])
+
+    def test_resume_restores_only_the_gpus_this_machine_has(self):
+        import torch
+
+        from finetune.checkpoints import load_checkpoint, save_checkpoint
+
+        two_gpus = [torch.get_rng_state(), torch.get_rng_state()]
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("torch.cuda.is_available", return_value=True), mock.patch("torch.cuda.get_rng_state_all", return_value=two_gpus):
+                path, _ = save_checkpoint(Path(tmp), 1, *self._setup(), {})
+            with mock.patch("torch.cuda.is_available", return_value=True), mock.patch("torch.cuda.device_count", return_value=1), \
+                    mock.patch("torch.cuda.set_rng_state_all") as restore:
+                load_checkpoint(path, *self._setup())
+        self.assertEqual(len(restore.call_args.args[0]), 1)
+
+
+@unittest.skipUnless(HAS_TORCH, "torch and safetensors are installed by the cuda extra")
+class BestAdapterTests(unittest.TestCase):
+    class Saver:
+        def __init__(self, text=None, error=None):
+            self.text, self.error = text, error
+
+        def save_pretrained(self, path):
+            if self.error:
+                Path(path).mkdir(parents=True, exist_ok=True)
+                raise self.error
+            Path(path).mkdir(parents=True, exist_ok=True)
+            (Path(path) / "weights").write_text(self.text)
+
+    def test_a_new_best_replaces_the_old_one(self):
+        from finetune.checkpoints import save_best_adapter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            save_best_adapter(run_dir, self.Saver("first"), self.Saver("processor"))
+            save_best_adapter(run_dir, self.Saver("second"), self.Saver("processor"))
+            self.assertEqual((run_dir / "best_adapter" / "weights").read_text(), "processor")
+            self.assertEqual([p.name for p in run_dir.iterdir()], ["best_adapter"])
+
+    def test_a_failed_save_keeps_the_previous_best(self):
+        from safetensors import SafetensorError
+
+        from finetune.checkpoints import save_best_adapter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            save_best_adapter(run_dir, self.Saver("x"), self.Saver("good"))
+            with self.assertRaises(OSError):
+                save_best_adapter(run_dir, self.Saver(error=SafetensorError("Disk quota exceeded")), self.Saver("new"))
+            self.assertEqual((run_dir / "best_adapter" / "weights").read_text(), "good")
+            self.assertEqual([p.name for p in run_dir.iterdir()], ["best_adapter"])
+
+
+class RunStateTests(unittest.TestCase):
+    def test_events_and_status_record_where_the_run_was(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = RunState(Path(tmp))
+            state.phase("training", epoch=2, step=40)
+            Heartbeat(state, seconds=0)(step=41)
+            try:
+                raise RuntimeError("CUDA out of memory")
+            except RuntimeError as error:
+                state.failed(error)
+            status = json.loads((Path(tmp) / "status.json").read_text())
+            events = [json.loads(line) for line in (Path(tmp) / "events.jsonl").read_text().splitlines()]
+        self.assertEqual(status["phase"], "failed")
+        self.assertEqual(status["step"], 41)
+        self.assertEqual(status["epoch"], 2)
+        self.assertIn("disk_free_gib_run_dir", status["resources"])
+        self.assertEqual([e["event"] for e in events], ["training", "failed"])
+        self.assertIn("CUDA out of memory", events[-1]["traceback"])
+
+    def test_sigterm_is_logged_before_the_run_stops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = RunState(Path(tmp))
+            previous = signal.getsignal(signal.SIGTERM)
+            try:
+                state.catch_signals()
+                with self.assertRaises(SystemExit) as stopped:
+                    signal.raise_signal(signal.SIGTERM)
+            finally:
+                signal.signal(signal.SIGTERM, previous)
+                signal.signal(signal.SIGHUP, signal.SIG_DFL)
+                signal.signal(signal.SIGINT, signal.default_int_handler)
+            events = [json.loads(line) for line in (Path(tmp) / "events.jsonl").read_text().splitlines()]
+        self.assertEqual(stopped.exception.code, 128 + signal.SIGTERM)
+        self.assertEqual(events[-1]["event"], "signal")
+        self.assertEqual(events[-1]["signal"], "SIGTERM")
+
+    def test_a_log_write_error_does_not_stop_the_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "events.jsonl").mkdir()      # opening these for writing now fails
+            (run_dir / "status.json.tmp").mkdir()
+            state = RunState(run_dir)
+            with mock.patch("sys.stderr"):
+                state.phase("training", step=1)
+                Heartbeat(state, seconds=0)(step=2)
+                state.failed(RuntimeError("real error"))
+            self.assertEqual(state.status["step"], 2)
+
+    def test_disabled_state_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = RunState(Path(tmp) / "run", enabled=False)
+            state.phase("training")
+            self.assertFalse((Path(tmp) / "run").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

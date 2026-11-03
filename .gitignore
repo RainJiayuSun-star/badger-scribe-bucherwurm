@@ -1,0 +1,26 @@
+# Competition dump (large JPGs)
+badger-scribe-data/
+badger-scribe.zip
+
+# Rebuilt locally from train.csv; they hold competition label text
+*_solution.csv
+train_full.json
+
+# Intermediate inference artifacts
+runs/
+
+# Python / OS
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+uv-cache/
+.env
+.DS_Store
+Thumbs.db
+
+# Model caches (if someone downloads into the repo)
+*.safetensors
+*.bin
+.cache/
+huggingface/

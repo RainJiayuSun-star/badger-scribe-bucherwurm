@@ -1,0 +1,21 @@
+# Churro-3B, bf16 LoRA (no 4-bit), for one 24 GB A5000.
+# Survey spreads get a larger image budget than the other categories.
+model_name: churro-3b-bf16
+model_id: stanford-oval/churro-3B
+curriculum: kade
+quantization: none
+image_patch_size: 14
+max_pixels: 1003520            # 1280 image tokens, about 1.0 MP
+max_pixels_by_category:
+  survey_notes: 2007040        # 2560 image tokens, about 2.0 MP
+max_seq_length: 8192
+epochs: 3
+per_device_batch_size: 1
+effective_batch_size: 8
+learning_rate: 0.0001
+vision_learning_rate: 0.00002
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+adapter_policy: language_projector
+eval_max_new_tokens: 4096
