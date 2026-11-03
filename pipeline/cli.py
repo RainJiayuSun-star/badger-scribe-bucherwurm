@@ -52,6 +52,11 @@ def main() -> int:
     settings = GatewaySettings(args.base_url, args.model, args.max_tokens, args.timeout, args.retries)
     page_ids = read_page_ids(args.input_csv)
     predictions = {} if args.no_resume else read_completed(args.output_csv)
+    stray = [page_id for page_id in predictions if page_id not in page_ids]
+    if stray:
+        print(f"{args.output_csv} has {len(stray)} saved pages that aren't in {args.input_csv} (e.g. {stray[0]}), and this run "
+              f"would delete them. Use the matching input, another --output-csv, or --no-resume.", file=sys.stderr)
+        return 2
     pending = [page_id for page_id in page_ids if page_id not in predictions]
     if args.page_ids:
         unknown = [page_id for page_id in args.page_ids if page_id not in page_ids]

@@ -1,6 +1,6 @@
 """Accelerate + QLoRA trainer for Badger Scribe page transcription.
 
-Run with: accelerate launch --num_processes 2 -m finetune.train --config ...
+Run with: accelerate launch --num_processes 1 -m finetune.train --config ...
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ import math
 import os
 import platform
 import random
-import subprocess
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -20,9 +19,11 @@ from typing import Any
 
 import numpy as np
 
+from benchmark.common import load_metric
+
 from .augmentation import OCRAugmenter, load_profile
-from .checkpoints import (DISK_MARGIN_BYTES, checkpoint_dir, disk_free, estimate_bytes, latest_checkpoint,
-                          load_checkpoint, prune_checkpoints, save_checkpoint)
+from .checkpoints import (DISK_MARGIN_BYTES, disk_free, estimate_bytes, latest_checkpoint, load_checkpoint,
+                          prune_checkpoints, save_best_adapter, save_checkpoint)
 from .preflight import run_checks
 from .runstate import Heartbeat, RunState
 from .config import load_config, resolve_curriculum, resolved_config_json
@@ -90,6 +91,7 @@ class MetricWriter:
             "step", "elapsed_seconds", "epoch", "stage", "train_loss", "learning_rate", "gradient_norm",
             "examples_per_second", "peak_gpu_memory_mb", "val_macro_cer", "val_wer", "val_length_ratio",
             "val_runaway_count", "val_loop_cuts", "val_cer_kade_letters", "val_cer_dominy_accounts", "val_cer_survey_notes",
+            "val_human_macro_cer", "val_human_pages",
         ]
         self.writer = csv.DictWriter(self.csv_file, fieldnames=fields, extrasaction="ignore")
         if self.csv_file.tell() == 0:
@@ -144,8 +146,8 @@ def save_epoch_checkpoint(state: RunState, directory: Path, step: int, model, op
                           need: int, keep: int, payload: dict[str, Any]) -> Path | None:
     """Save a resume checkpoint if the disk has room, then drop the oldest beyond `keep`.
 
-    A full disk skips the save with an event instead of crashing the run: the
-    epoch's predictions and best_adapter are already written by then.
+    A full disk or failed write skips the save with an event instead of crashing
+    the run: the epoch's predictions and best_adapter are already written by then.
     """
     free = disk_free(directory)
     if free < need:
@@ -154,22 +156,34 @@ def save_epoch_checkpoint(state: RunState, directory: Path, step: int, model, op
         return None
     state.phase("saving_checkpoint", step=step)
     started = time.monotonic()
-    path, size = save_checkpoint(directory, step, model, optimizer, scheduler, payload)
-    removed = prune_checkpoints(directory, keep)
+    try:
+        path, size = save_checkpoint(directory, step, model, optimizer, scheduler, payload)
+        removed = prune_checkpoints(directory, keep)
+    except OSError as error:
+        state.event("checkpoint_skipped", reason="write_error", step=step, error=str(error))
+        print(f"WARNING: skipped the checkpoint at step {step}: {error}", flush=True)
+        return None
     state.event("checkpoint_saved", path=str(path), size_gib=round(size / 1024**3, 3),
                 seconds=round(time.monotonic() - started, 1), removed=[p.name for p in removed])
     return path
 
 
-def evaluate(model, processor, rows: list[dict[str, str]], device, config: dict[str, Any], output: Path, on_page=None) -> dict[str, float]:
-    """Evaluate only on the fixed human development set."""
-    from importlib.util import module_from_spec, spec_from_file_location
+def human_cer(page_scores: list[dict[str, Any]]) -> tuple[float | None, int]:
+    """Macro CER over human-labeled pages alone, and how many there are."""
+    by_category: dict[str, list[float]] = defaultdict(list)
+    for page in page_scores:
+        if page["label_source"] == "human":
+            by_category[page["category"]].append(page["cer"])
+    count = sum(len(values) for values in by_category.values())
+    return (float(np.mean([np.mean(values) for values in by_category.values()])) if count else None), count
 
-    metric_path = Path(config["data_root"]) / "metric.py"
-    spec = spec_from_file_location("badger_metric", metric_path)
-    metric = module_from_spec(spec)
-    assert spec and spec.loader
-    spec.loader.exec_module(metric)
+
+def evaluate(model, processor, rows: list[dict[str, str]], device, config: dict[str, Any], output: Path, on_page=None) -> dict[str, float]:
+    """Score rows: CER over all of them, plus human-labeled pages alone (val_human_*).
+
+    Fold development sets are mostly machine drafts on English documents.
+    """
+    metric = load_metric(Path(config["data_root"]))
     model.eval()
     preds, decode_info = generate_texts(model, processor, rows, device, int(config.get("eval_max_new_tokens", 2048)), config, on_page)
     write_predictions(output, rows, preds)
@@ -191,6 +205,7 @@ def evaluate(model, processor, rows: list[dict[str, str]], device, config: dict[
         ratios.append(ratio)
         runaways += int(ratio > 2.5)
     result: dict[str, float] = {"val_macro_cer": float(np.mean([np.mean(values) for values in by_category.values()]))}
+    result["val_human_macro_cer"], result["val_human_pages"] = human_cer(page_scores)
     result["val_wer"] = float(np.mean([value for values in wers.values() for value in values]))
     result["val_length_ratio"] = float(np.mean(ratios))
     result["val_runaway_count"] = float(runaways)
@@ -223,7 +238,9 @@ def stage_rows(partition: dict[str, Any], curriculum: dict[str, Any], human_repe
     for stage in curriculum["stages"]:
         rows = []
         for row in selected_rows(partition, stage, "train"):
-            rows += [row] * (human_repeats if row["label_source"] == "human" else 1)
+            copies = human_repeats if row["label_source"] == "human" else 1
+            # The repeat number gives each copy its own augmentation (see vlm.augmentation_key).
+            rows += [row] if copies == 1 else [dict(row, repeat=index) for index in range(copies)]
         stages.append(rows)
     return stages
 
@@ -235,7 +252,9 @@ def main() -> int:
         return run(args, holder)
     except BaseException as error:
         state = holder.get("state")
-        if state and not (isinstance(error, SystemExit) and error.code in (0, None)):
+        # A shutdown signal already logged itself; that is not a crash.
+        stopped = state and state.status.get("phase") == "stopping"
+        if state and not stopped and not (isinstance(error, SystemExit) and error.code in (0, None)):
             state.failed(error)
         raise
 
@@ -279,6 +298,8 @@ def run(args: argparse.Namespace, holder: dict[str, RunState]) -> int:
     set_seed(int(config["seed"]))
     seed_everything(int(config["seed"]))
 
+    # Before anything reads the data, so a missing folder gets the clear message.
+    run_checks(config, run_dir, args.resume, args.eval_only)
     rows = read_rows(Path(config["data_root"]))
     if config.get("use_cleaned_labels", True):
         # "target" is what the model learns; "text" stays the original key for scoring.
@@ -305,14 +326,12 @@ def run(args: argparse.Namespace, holder: dict[str, RunState]) -> int:
     config["augmentation_profile"] = str(profile_path)
     config["augmentation"] = profile
 
-    checkpoints_root = checkpoint_dir(config, run_dir)
-    run_checks(config, run_dir, checkpoints_root, args.resume, args.eval_only)
     if accelerator.is_main_process:
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "config.json").write_text(resolved_config_json(config), encoding="utf-8")
         (run_dir / "environment.json").write_text(json.dumps(version_info(), indent=2) + "\n", encoding="utf-8")
         write_manifest(run_dir / "manifest.json", partition, curriculum, stages)
-    state = RunState(run_dir, {"run_dir": run_dir, "checkpoints": checkpoints_root}, enabled=accelerator.is_main_process)
+    state = RunState(run_dir, enabled=accelerator.is_main_process)
     holder["state"] = state
     state.catch_signals()
     state.phase("loading_model", run_id=config["run_id"], fold=config.get("fold"), eval_only=args.eval_only, resume=args.resume)
@@ -328,7 +347,7 @@ def run(args: argparse.Namespace, holder: dict[str, RunState]) -> int:
             state.phase("evaluating", fold=fold_path.stem, eval_pages=len(fold_rows))
             result = evaluate(model, processor, fold_rows, accelerator.device, config, run_dir / "zero_shot" / f"{fold_path.stem}-preds.csv",
                               on_page=lambda done, total: heartbeat(eval_page=done, eval_pages=total))
-            state.event("evaluated", fold=fold_path.stem, cer=result["val_macro_cer"], loop_cuts=result["val_loop_cuts"])
+            state.event("evaluated", fold=fold_path.stem, cer=result["val_macro_cer"], human_cer=result["val_human_macro_cer"], loop_cuts=result["val_loop_cuts"])
             result["pages"] = len(fold_rows)
             summary[fold_path.stem] = result
             print(f"{fold_path.stem}: CER {result['val_macro_cer']:.4f} over {len(fold_rows)} pages", flush=True)
@@ -358,7 +377,7 @@ def run(args: argparse.Namespace, holder: dict[str, RunState]) -> int:
     resume_stage_epoch = 0
     best_cer = float("inf")
     if args.resume:
-        checkpoint = latest_checkpoint(checkpoints_root)
+        checkpoint = latest_checkpoint(run_dir)
         if checkpoint:
             saved = load_checkpoint(checkpoint, accelerator.unwrap_model(model), optimizer, scheduler)
             global_step = int(saved["global_step"])
@@ -368,7 +387,7 @@ def run(args: argparse.Namespace, holder: dict[str, RunState]) -> int:
             best_cer = float(saved.get("best_cer", best_cer))
             state.event("resumed", checkpoint=str(checkpoint), step=global_step, best_cer=best_cer)
         else:
-            state.event("resume_requested_but_no_checkpoint", directory=str(checkpoints_root))
+            state.event("resume_requested_but_no_checkpoint", directory=str(run_dir))
     checkpoint_need = estimate_bytes(accelerator.unwrap_model(model)) + DISK_MARGIN_BYTES
     progress = tqdm(total=total_steps, initial=global_step, disable=not accelerator.is_local_main_process, desc=f"{config['model_name']} {curriculum['name']}")
     started = time.monotonic()
@@ -419,15 +438,19 @@ def run(args: argparse.Namespace, holder: dict[str, RunState]) -> int:
                     result = evaluate(unwrapped, processor, dev_rows, accelerator.device, config, run_dir / "development" / f"epoch-{epoch + 1}-preds.csv",
                                       on_page=lambda done, total: heartbeat(eval_page=done, eval_pages=total))
                     result.update({"epoch": epoch + 1, "stage": stage_index + 1})
-                    state.event("evaluated", epoch=epoch + 1, cer=result["val_macro_cer"], loop_cuts=result["val_loop_cuts"])
+                    state.event("evaluated", epoch=epoch + 1, cer=result["val_macro_cer"], human_cer=result["val_human_macro_cer"], loop_cuts=result["val_loop_cuts"])
                     if writer:
                         writer.log(result, global_step)
                     if result["val_macro_cer"] < best_cer:
-                        best_cer = result["val_macro_cer"]
-                        unwrapped.save_pretrained(run_dir / "best_adapter")
-                        processor.save_pretrained(run_dir / "best_adapter")
-                        state.event("best_adapter_saved", epoch=epoch + 1, cer=best_cer)
-                    save_epoch_checkpoint(state, checkpoints_root, global_step, unwrapped, optimizer, scheduler, checkpoint_need, int(config["keep_checkpoints"]),
+                        try:
+                            save_best_adapter(run_dir, unwrapped, processor)
+                        except OSError as error:
+                            state.event("best_adapter_skipped", epoch=epoch + 1, cer=result["val_macro_cer"], error=str(error))
+                            print(f"WARNING: kept the previous best_adapter: {error}", flush=True)
+                        else:
+                            best_cer = result["val_macro_cer"]
+                            state.event("best_adapter_saved", epoch=epoch + 1, cer=best_cer)
+                    save_epoch_checkpoint(state, run_dir, global_step, unwrapped, optimizer, scheduler, checkpoint_need, int(config["keep_checkpoints"]),
                                           {"global_step": global_step, "epoch": epoch + 1, "stage": stage_index + 1, "stage_epoch": stage_epoch + 1, "best_cer": best_cer})
                 accelerator.wait_for_everyone()
                 if global_step >= total_steps:

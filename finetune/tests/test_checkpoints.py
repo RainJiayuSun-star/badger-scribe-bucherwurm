@@ -6,8 +6,9 @@ import signal
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from finetune.checkpoints import checkpoint_dir, checkpoints_by_step, latest_checkpoint, prune_checkpoints
+from finetune.checkpoints import checkpoints_by_step, latest_checkpoint, prune_checkpoints
 from finetune.runstate import Heartbeat, RunState
 
 HAS_TORCH = importlib.util.find_spec("torch") is not None and importlib.util.find_spec("safetensors") is not None
@@ -40,11 +41,6 @@ class FifoTests(unittest.TestCase):
             self.assertEqual([p.name for p in checkpoints_by_step(root)], ["checkpoint-10"])
             self.assertEqual(prune_checkpoints(root, keep=1), [])
             self.assertEqual(latest_checkpoint(root).name, "checkpoint-10")
-
-    def test_checkpoint_root_is_separate_from_the_run_directory(self):
-        run_dir = Path("/home/runs/abc")
-        self.assertEqual(checkpoint_dir({"run_id": "abc"}, run_dir), run_dir)
-        self.assertEqual(checkpoint_dir({"run_id": "abc", "checkpoint_root": "/tmp/ck"}, run_dir), Path("/tmp/ck/abc"))
 
 
 @unittest.skipUnless(HAS_TORCH, "torch and safetensors are installed by the cuda extra")
@@ -104,6 +100,88 @@ class RoundTripTests(unittest.TestCase):
             self.assertEqual(sorted(load_file(str(path / "trainable.safetensors"))), ["0.bias", "1.bias", "1.weight"])
 
 
+@unittest.skipUnless(HAS_TORCH, "torch and safetensors are installed by the cuda extra")
+class WriteFailureTests(unittest.TestCase):
+    def _setup(self):
+        import torch
+
+        model = torch.nn.Linear(2, 2)
+        optimizer = torch.optim.AdamW(model.parameters())
+        return model, optimizer, torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+
+    def test_a_full_disk_becomes_oserror_and_leaves_no_partial_files(self):
+        from safetensors import SafetensorError
+
+        from finetune.checkpoints import save_checkpoint
+
+        # What a full disk really raises: not OSError, from either writer.
+        for target, error in (("safetensors.torch.save_file", SafetensorError("Disk quota exceeded")),
+                              ("torch.save", RuntimeError("file write failed"))):
+            with self.subTest(target), tempfile.TemporaryDirectory() as tmp, mock.patch(target, side_effect=error):
+                with self.assertRaises(OSError):
+                    save_checkpoint(Path(tmp), 1, *self._setup(), {})
+                self.assertEqual(list(Path(tmp).iterdir()), [])
+
+    def test_a_leftover_partial_checkpoint_is_cleared_by_the_next_save(self):
+        from finetune.checkpoints import save_checkpoint
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "partial-checkpoint-3").mkdir()
+            save_checkpoint(Path(tmp), 4, *self._setup(), {})
+            self.assertEqual([p.name for p in Path(tmp).iterdir()], ["checkpoint-4"])
+
+    def test_resume_restores_only_the_gpus_this_machine_has(self):
+        import torch
+
+        from finetune.checkpoints import load_checkpoint, save_checkpoint
+
+        two_gpus = [torch.get_rng_state(), torch.get_rng_state()]
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("torch.cuda.is_available", return_value=True), mock.patch("torch.cuda.get_rng_state_all", return_value=two_gpus):
+                path, _ = save_checkpoint(Path(tmp), 1, *self._setup(), {})
+            with mock.patch("torch.cuda.is_available", return_value=True), mock.patch("torch.cuda.device_count", return_value=1), \
+                    mock.patch("torch.cuda.set_rng_state_all") as restore:
+                load_checkpoint(path, *self._setup())
+        self.assertEqual(len(restore.call_args.args[0]), 1)
+
+
+@unittest.skipUnless(HAS_TORCH, "torch and safetensors are installed by the cuda extra")
+class BestAdapterTests(unittest.TestCase):
+    class Saver:
+        def __init__(self, text=None, error=None):
+            self.text, self.error = text, error
+
+        def save_pretrained(self, path):
+            if self.error:
+                Path(path).mkdir(parents=True, exist_ok=True)
+                raise self.error
+            Path(path).mkdir(parents=True, exist_ok=True)
+            (Path(path) / "weights").write_text(self.text)
+
+    def test_a_new_best_replaces_the_old_one(self):
+        from finetune.checkpoints import save_best_adapter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            save_best_adapter(run_dir, self.Saver("first"), self.Saver("processor"))
+            save_best_adapter(run_dir, self.Saver("second"), self.Saver("processor"))
+            self.assertEqual((run_dir / "best_adapter" / "weights").read_text(), "processor")
+            self.assertEqual([p.name for p in run_dir.iterdir()], ["best_adapter"])
+
+    def test_a_failed_save_keeps_the_previous_best(self):
+        from safetensors import SafetensorError
+
+        from finetune.checkpoints import save_best_adapter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            save_best_adapter(run_dir, self.Saver("x"), self.Saver("good"))
+            with self.assertRaises(OSError):
+                save_best_adapter(run_dir, self.Saver(error=SafetensorError("Disk quota exceeded")), self.Saver("new"))
+            self.assertEqual((run_dir / "best_adapter" / "weights").read_text(), "good")
+            self.assertEqual([p.name for p in run_dir.iterdir()], ["best_adapter"])
+
+
 class RunStateTests(unittest.TestCase):
     def test_events_and_status_record_where_the_run_was(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -139,6 +217,18 @@ class RunStateTests(unittest.TestCase):
         self.assertEqual(stopped.exception.code, 128 + signal.SIGTERM)
         self.assertEqual(events[-1]["event"], "signal")
         self.assertEqual(events[-1]["signal"], "SIGTERM")
+
+    def test_a_log_write_error_does_not_stop_the_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "events.jsonl").mkdir()      # opening these for writing now fails
+            (run_dir / "status.json.tmp").mkdir()
+            state = RunState(run_dir)
+            with mock.patch("sys.stderr"):
+                state.phase("training", step=1)
+                Heartbeat(state, seconds=0)(step=2)
+                state.failed(RuntimeError("real error"))
+            self.assertEqual(state.status["step"], 2)
 
     def test_disabled_state_writes_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:

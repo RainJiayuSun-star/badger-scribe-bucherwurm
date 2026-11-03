@@ -4,7 +4,10 @@
 
 Adapt `stanford-oval/churro-3B` and `Qwen/Qwen2.5-VL-7B-Instruct` to Badger
 Scribe while measuring improvements on human-labelled material. The frozen
-119-page Release 09 holdout is never used for training or checkpoint choice.
+119-page Release 09 holdout is never used for training or checkpoint choice in
+the default protocol. Fold runs (`--fold`) replace it: they hold out whole
+documents and do train on those holdout pages, so a fold-trained model must not
+be scored on that holdout.
 
 ## Data contract
 
@@ -44,9 +47,8 @@ for measuring whether augmentation helps.
 ## Execution and evidence
 
 QLoRA (NF4, BF16 compute) with gradient checkpointing is the default. The
-trainer works through `accelerate launch` on one, two, or four-plus A5000 GPUs;
-it adjusts gradient accumulation to preserve the configured effective global
-batch. Each run writes resumable checkpoints, a terminal progress bar,
+trainer runs through `accelerate launch` on one GPU; multi-GPU runs aren't
+supported. Each run writes resumable checkpoints, a terminal progress bar,
 TensorBoard events, `metrics.csv`, `metrics.jsonl`, predictions, and config /
 environment / GPU provenance. W&B receives scalar metrics only when
 `WANDB_API_KEY` is present.

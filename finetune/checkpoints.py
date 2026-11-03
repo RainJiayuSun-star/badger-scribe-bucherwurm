@@ -31,10 +31,11 @@ STATE_FILE = "state.json"
 DISK_MARGIN_BYTES = 512 * 1024**2
 
 
-def checkpoint_dir(config: dict[str, Any], run_dir: Path) -> Path:
-    """Where resume checkpoints go. Everything else stays in run_dir."""
-    root = config.get("checkpoint_root")
-    return Path(root) / config["run_id"] if root else run_dir
+def _write_errors() -> tuple[type[BaseException], ...]:
+    """What a full disk raises: safetensors and torch.save don't use OSError."""
+    from safetensors import SafetensorError
+
+    return (OSError, RuntimeError, SafetensorError)
 
 
 def checkpoints_by_step(directory: Path) -> list[Path]:
@@ -81,32 +82,68 @@ def _directory_bytes(path: Path) -> int:
 
 
 def save_checkpoint(directory: Path, step: int, model, optimizer, scheduler, state: dict[str, Any]) -> tuple[Path, int]:
-    """Write checkpoint-<step> atomically. Returns its path and size in bytes."""
+    """Write checkpoint-<step> atomically. Returns its path and size in bytes.
+
+    A failed write raises OSError and leaves no partial files behind.
+    """
     import torch
     from safetensors.torch import save_file
 
     final = directory / f"{PREFIX}{step}"
     partial = directory / f"{PARTIAL_PREFIX}{PREFIX}{step}"
-    if partial.exists():
-        shutil.rmtree(partial)
-    partial.mkdir(parents=True)
-    weights = {name: p.detach().to("cpu").contiguous() for name, p in trainable_parameters(model).items()}
-    save_file(weights, str(partial / "trainable.safetensors"))
-    torch.save(optimizer.state_dict(), partial / "optimizer.pt")
-    torch.save(scheduler.state_dict(), partial / "scheduler.pt")
-    rng = {
-        "python": random.getstate(),
-        "numpy": np.random.get_state(),
-        "torch": torch.get_rng_state(),
-        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
-    }
-    with (partial / "rng.pkl").open("wb") as handle:
-        pickle.dump(rng, handle)
-    (partial / STATE_FILE).write_text(json.dumps({**state, "step": step}, indent=2) + "\n", encoding="utf-8")
+    for leftover in directory.glob(f"{PARTIAL_PREFIX}*"):   # from a run killed mid-save
+        shutil.rmtree(leftover)
+    try:
+        partial.mkdir(parents=True)
+        weights = {name: p.detach().to("cpu").contiguous() for name, p in trainable_parameters(model).items()}
+        save_file(weights, str(partial / "trainable.safetensors"))
+        torch.save(optimizer.state_dict(), partial / "optimizer.pt")
+        torch.save(scheduler.state_dict(), partial / "scheduler.pt")
+        rng = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+        }
+        with (partial / "rng.pkl").open("wb") as handle:
+            pickle.dump(rng, handle)
+        (partial / STATE_FILE).write_text(json.dumps({**state, "step": step}, indent=2) + "\n", encoding="utf-8")
+    except _write_errors() as error:
+        shutil.rmtree(partial, ignore_errors=True)
+        raise OSError(f"could not write {partial}: {error}") from error
     if final.exists():
         shutil.rmtree(final)
     os.replace(partial, final)
     return final, _directory_bytes(final)
+
+
+def save_best_adapter(run_dir: Path, model, processor) -> Path:
+    """Write best_adapter under a temporary name, then swap it in when complete.
+
+    A run killed or out of disk mid-save leaves the previous best untouched. A
+    failed write raises OSError.
+    """
+    final = run_dir / "best_adapter"
+    partial = run_dir / f"{PARTIAL_PREFIX}best_adapter"
+    previous = run_dir / "previous-best_adapter"
+    # shortcut: a kill between the two renames below leaves the model in previous-best_adapter; rename it back by hand if that ever happens.
+    if previous.exists() and not final.exists():
+        previous.rename(final)
+    for leftover in (partial, previous):
+        if leftover.exists():
+            shutil.rmtree(leftover)
+    try:
+        model.save_pretrained(partial)
+        processor.save_pretrained(partial)
+    except _write_errors() as error:
+        shutil.rmtree(partial, ignore_errors=True)
+        raise OSError(f"could not write {partial}: {error}") from error
+    if final.exists():
+        final.rename(previous)
+    partial.rename(final)
+    if previous.exists():
+        shutil.rmtree(previous)
+    return final
 
 
 def load_checkpoint(path: Path, model, optimizer, scheduler) -> dict[str, Any]:
@@ -130,5 +167,6 @@ def load_checkpoint(path: Path, model, optimizer, scheduler) -> dict[str, Any]:
     np.random.set_state(rng["numpy"])
     torch.set_rng_state(rng["torch"])
     if rng["cuda"] and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(rng["cuda"])
+        # The resuming machine may have fewer GPUs than the one that saved this.
+        torch.cuda.set_rng_state_all(rng["cuda"][:torch.cuda.device_count()])
     return json.loads((path / STATE_FILE).read_text(encoding="utf-8"))

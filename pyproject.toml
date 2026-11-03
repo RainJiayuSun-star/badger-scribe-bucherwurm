@@ -29,7 +29,6 @@ cuda = [
 ]
 finetune = [
     "bitsandbytes>=0.43",
-    "datasets>=2.20",
     "peft>=0.12",
     "pyyaml>=6.0",
     "tensorboard>=2.17",

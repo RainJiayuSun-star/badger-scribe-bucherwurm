@@ -32,3 +32,20 @@ class CliTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 2)
             self.assertIn("page ID not found", result.stderr)
+
+    def test_refuses_to_delete_saved_pages_missing_from_the_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            input_csv, output_csv = root / "pages.csv", root / "out.csv"
+            input_csv.write_text("page_id\nkept\n", encoding="utf-8")
+            saved = "page_id,text\nkept,a\nother,b\n"
+            output_csv.write_text(saved, encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(ENTRYPOINT), "--input-csv", str(input_csv),
+                 "--image-dir", str(root), "--output-csv", str(output_csv)],
+                env={"OPENAI_API_KEY": "placeholder"},
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("would delete them", result.stderr)
+            self.assertEqual(output_csv.read_text(encoding="utf-8"), saved)

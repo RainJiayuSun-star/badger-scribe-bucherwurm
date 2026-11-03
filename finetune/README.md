@@ -2,7 +2,9 @@
 
 The fine-tuning harness trains page-level Qwen-family vision-language models
 on Release 09 with CUDA, Accelerate, QLoRA, resumable checkpoints, and local
-metrics. It never trains on `splits/release_09/holdout.json`.
+metrics. The default run never trains on `splits/release_09/holdout.json`. Fold
+runs (`--fold`) hold out whole documents instead and do train on those pages, so
+never score a fold-trained model on that holdout.
 
 ## Setup on the A5000 host
 
@@ -11,21 +13,14 @@ uv sync --extra cuda --extra finetune
 accelerate config
 ```
 
-Use one GPU to prove a configuration, then scale the same configuration without
-changing its effective global batch size:
+Run each job on one GPU. Multi-GPU runs aren't supported: the other GPUs can time
+out waiting during scoring, `--eval-only` writes the same files from every
+process, and step counts assume one process.
 
 ```bash
-# One A5000 smoke run
+# Smoke run
 accelerate launch --num_processes 1 -m finetune.train \
   --config finetune/configs/churro-3b.yaml --max-steps 2
-
-# Two A5000 GPUs
-accelerate launch --num_processes 2 -m finetune.train \
-  --config finetune/configs/qwen25vl-7b.yaml
-
-# Four A5000 GPUs
-accelerate launch --num_processes 4 -m finetune.train \
-  --config finetune/configs/qwen25vl-7b.yaml --curriculum kade-dominy-survey
 ```
 
 The curriculum names are listed in `finetune/configs/curricula.yaml`. A run
@@ -56,7 +51,7 @@ default random development set flatters a model that has memorized a writer.
 Score on whole held-out documents instead:
 
 ```bash
-python -m finetune.prep     # cleaned targets and spread splits -> runs/prep/records.jsonl (summary only)
+python -m finetune.prep     # cleaned targets -> runs/prep/records.jsonl (summary only)
 python -m finetune.folds    # 19 fold files -> runs/folds/<name>.json
 ```
 
@@ -78,6 +73,11 @@ accelerate launch --num_processes 1 --mixed_precision no -m finetune.train \
 Each evaluation writes predictions plus a `*-scores.csv` with per-page CER,
 length ratio and whether the loop guard fired, so bad pages are easy to find.
 
+`best_adapter` is chosen on all held-out pages. English folds are mostly machine
+drafts and hold very few human pages, so `val_human_macro_cer` and
+`val_human_pages` report the human-labeled pages alone, and they should be
+checked too.
+
 ## Training and decoding options
 
 | Config key | Default | Effect |
@@ -90,7 +90,6 @@ length ratio and whether the loop guard fired, so bad pages are easy to find.
 | `loop_guard` | true | Stop decoding at a repetition loop and keep its first copy (`finetune/loopguard.py`) |
 | `loop_retry_temperatures` | `[]` | If set, re-decode looping or near-empty pages with sampling at these temperatures |
 | `keep_checkpoints` | 2 | FIFO: after a new resume checkpoint is complete, delete the oldest beyond N (0 keeps all) |
-| `checkpoint_root` | run directory | Put resume checkpoints somewhere other than the run directory |
 | `min_free_disk_gib`, `min_free_gpu_gib` | 2, 12 | Preflight thresholds; 0 turns a check off |
 
 No option reads `label_source` at inference time; the competition forbids
@@ -103,7 +102,9 @@ changes: the LoRA weights, optimizer and scheduler state and random-number
 state (about 0.4 GB for Churro-3B, not the 7.4 GB of a full model). It is
 written under a temporary name and renamed when complete, and only then are
 older ones deleted, so the last complete epoch is always on disk. If the disk
-lacks room, the checkpoint is skipped with a warning and training continues.
+lacks room or a write fails, the checkpoint is skipped with a warning and training
+continues. `best_adapter` is swapped in the same way, so a failed save keeps the
+previous best.
 `--resume` with the same `--run-id` continues from the newest one.
 
 Every run also writes two files to its run directory for diagnosing a run
@@ -123,7 +124,8 @@ the traceback.
 Before loading the model, a run checks that the data is in place, that the run
 and checkpoint directories have `min_free_disk_gib` free, that the GPU has
 `min_free_gpu_gib` free, that the same run is not already running, and that it
-would not start over on top of existing checkpoints without `--resume`. If
+would not start over on existing checkpoints without `--resume`, or over a
+finished `best_adapter` with no checkpoint to continue from. If
 anything fails it exits before doing any work and lists every problem (above
 accelerate's own traceback).
 
@@ -133,16 +135,17 @@ How to read the last line of `events.jsonl`:
 | --- | --- |
 | `finished` | The run completed |
 | `failed` | Python error; the `traceback` field says where |
-| `signal` (SIGTERM) | Stopped from outside, for example the workspace was shut down or evicted |
+| `signal` (SIGTERM) | Stopped from outside, for example the workspace was shut down or evicted. A pod's signal may not reach a run inside tmux; then see the last row |
 | anything else | Killed without warning (out of memory, node failure); `status.json` shows where it was |
 
 ## EFabric notes
 
 - `uv` is at `/opt/conda/bin/uv` and is not on the PATH of a non-interactive SSH command.
 - The home directory is JuiceFS, so the first import of torch and transformers takes a few minutes.
-- The home directory has a 64 GB quota; keep checkpoints there (the default). Do not
-  point `checkpoint_root` at `/tmp`: writing about 15 GB there got two workspaces
-  restarted, most likely by the pod's ephemeral-storage limit.
+- The home directory has a 64 GB quota, and run directories (with their small
+  checkpoints) belong there. Don't write large files to `/tmp`: about 15 GB of old
+  full-size checkpoints there got two workspaces restarted, most likely by the pod's
+  ephemeral-storage limit.
 - `scp` does not work on the workspace; copy single files with `ssh host 'cat > path' < path`.
 
 After locking a candidate on the human development set, score it once on the

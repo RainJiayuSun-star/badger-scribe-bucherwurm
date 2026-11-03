@@ -45,7 +45,6 @@ def load_config(path: Path) -> dict[str, Any]:
     config.setdefault("vision_learning_rate", 2.0e-5)
     config.setdefault("warmup_ratio", 0.05)
     config.setdefault("logging_steps", 5)
-    config.setdefault("save_every_epochs", 1)
     config.setdefault("augmentation_profile", str(ROOT / "finetune" / "augmentation" / "default.yaml"))
     config.setdefault("adapter_policy", "language_projector")
     config.setdefault("wandb_project", "badger-scribe-finetune")
@@ -74,8 +73,7 @@ def load_config(path: Path) -> dict[str, Any]:
     # Churro-3B at rank 16; see finetune/checkpoints.py), so by default they sit
     # in the run directory on persistent storage. keep_checkpoints is a FIFO:
     # after a new one is complete, the oldest beyond this many are deleted
-    # (0 keeps all). checkpoint_root moves them elsewhere.
-    config.setdefault("checkpoint_root", None)
+    # (0 keeps all).
     config.setdefault("keep_checkpoints", 2)
     # Preflight (finetune/preflight.py): refuse to start below these. Two
     # checkpoints, best_adapter and predictions take about 1 GiB; a Churro-3B

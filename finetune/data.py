@@ -1,6 +1,7 @@
 """Release 09 manifest and data-loading helpers.
 
-All split decisions live here so a run cannot silently train on a holdout page.
+All split decisions live here. The default partition excludes the Release 09
+holdout; fold partitions don't (see fold_partition).
 """
 
 from __future__ import annotations
@@ -55,7 +56,8 @@ def fold_partition(rows: list[dict[str, str]], fold_path: Path) -> dict[str, Any
     """Partition from a leave-one-document-out fold file (see finetune/folds.py).
 
     The fold's held-out documents become the development set, so checkpoints are
-    chosen on writers the model has not trained on.
+    chosen on documents the model has not trained on. Fold runs do train on
+    Release 09 holdout pages, so never score a fold-trained model on that holdout.
     """
     fold = json.loads(fold_path.read_text(encoding="utf-8"))
     eval_ids, train_ids = set(fold["eval_ids"]), set(fold["train_ids"])

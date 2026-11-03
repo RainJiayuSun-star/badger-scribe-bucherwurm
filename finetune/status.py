@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import socket
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,10 +15,7 @@ from typing import Any
 
 from .checkpoints import latest_checkpoint
 from .config import ROOT
-from .preflight import ACTIVE_PHASES
-
-# A run whose status has not been rewritten for this long is not making progress.
-STALE_SECONDS = 15 * 60
+from .preflight import ACTIVE_PHASES, STALE_SECONDS, age_seconds, pid_alive
 
 
 def read_events(run_dir: Path) -> list[dict[str, Any]]:
@@ -35,26 +31,11 @@ def read_events(run_dir: Path) -> list[dict[str, Any]]:
     return events
 
 
-def _age_seconds(stamp: str | None, now: datetime) -> float | None:
-    if not stamp:
-        return None
-    try:
-        return (now - datetime.fromisoformat(stamp)).total_seconds()
-    except ValueError:
-        return None
-
-
 def _alive(status: dict[str, Any]) -> bool | None:
     """Whether the run's process is alive, or None when it ran on another machine."""
     if status.get("host") != socket.gethostname() or not isinstance(status.get("pid"), int):
         return None
-    try:
-        os.kill(status["pid"], 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    return pid_alive(status["pid"])
 
 
 def verdict(status: dict[str, Any], events: list[dict[str, Any]], now: datetime | None = None) -> str:
@@ -70,12 +51,11 @@ def verdict(status: dict[str, Any], events: list[dict[str, Any]], now: datetime 
         return f"stopped from outside ({events[-1].get('signal')}), e.g. the workspace was shut down or evicted"
     if phase in ACTIVE_PHASES:
         alive = _alive(status)
-        age = _age_seconds(status.get("updated"), now)
+        age = age_seconds(status.get("updated"), now)
         minutes = f"{int(age // 60)} min ago" if age is not None else "at an unknown time"
         if alive is False:
             return f"died without warning while {phase} (out of memory, node failure, or workspace restart); last update {minutes}"
         if age is not None and age > STALE_SECONDS:
-            # The status is rewritten every 30 s while a run works, so this is stuck or gone.
             return f"no progress while {phase}; last update {minutes} (stuck, or died on another machine)"
         return f"running: {phase}"
     return f"unknown (phase {phase!r})"

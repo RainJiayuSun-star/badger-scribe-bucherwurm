@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import mimetypes
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -23,29 +25,45 @@ def encode_image(path: Path) -> str:
     return f"data:{mime};base64,{encoded}"
 
 
-def parse_stream(lines: Iterable[bytes]) -> tuple[str, dict[str, Any] | None, str | None]:
-    """Collect text, usage, and model metadata from OpenAI SSE response lines."""
+class IncompleteResponse(RuntimeError):
+    """The reply stopped before the model finished, so its text can't be trusted."""
+
+
+def parse_stream(lines: Iterable[bytes]) -> tuple[str, dict[str, Any] | None, str | None, str | None]:
+    """Collect text, usage, model and finish reason from OpenAI SSE response lines.
+
+    Raises IncompleteResponse on an error chunk, or if the stream ends with neither
+    [DONE] nor a finish reason.
+    """
     pieces: list[str] = []
     usage: dict[str, Any] | None = None
     response_model: str | None = None
+    finish_reason: str | None = None
+    done = False
     for raw_line in lines:
         line = raw_line.decode("utf-8", "replace").strip()
         if not line.startswith("data:"):
             continue
         event = line[5:].strip()
         if event == "[DONE]":
+            done = True
             break
         try:
             chunk = json.loads(event)
         except json.JSONDecodeError:
             continue
+        if chunk.get("error"):
+            raise IncompleteResponse(f"gateway stream error: {chunk['error']}")
         response_model = chunk.get("model") or response_model
         usage = chunk.get("usage") or usage
         for choice in chunk.get("choices") or []:
+            finish_reason = choice.get("finish_reason") or finish_reason
             content = (choice.get("delta") or {}).get("content")
             if isinstance(content, str):
                 pieces.append(content)
-    return "".join(pieces), usage, response_model
+    if not done and finish_reason is None:
+        raise IncompleteResponse("stream ended before the model finished")
+    return "".join(pieces), usage, response_model, finish_reason
 
 
 class GatewayBackend:
@@ -81,15 +99,18 @@ class GatewayBackend:
             )
             try:
                 with urllib.request.urlopen(request, timeout=self.settings.timeout) as response:
-                    text, usage, response_model = parse_stream(response)
+                    text, usage, response_model, finish_reason = parse_stream(response)
                 if not text:
-                    raise RuntimeError("gateway response contained no text content")
-                return text, {"elapsed_seconds": round(time.monotonic() - started, 3), "usage": usage, "response_model": response_model, "attempt": attempt + 1}
+                    raise IncompleteResponse("gateway response contained no text content")
+                if finish_reason == "length":
+                    # Kept, not retried: temperature is 0, so a retry hits the same cap, and a partial page beats a missing one.
+                    print(f"WARNING: {image.name} hit max_tokens; its transcription is cut off", file=sys.stderr)
+                return text, {"elapsed_seconds": round(time.monotonic() - started, 3), "usage": usage, "response_model": response_model, "finish_reason": finish_reason, "attempt": attempt + 1}
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", "replace")[:500]
                 if exc.code not in retryable or attempt == self.settings.retries:
                     raise RuntimeError(f"gateway HTTP {exc.code}: {detail}") from exc
-            except (urllib.error.URLError, TimeoutError) as exc:
+            except (IncompleteResponse, OSError, http.client.HTTPException) as exc:   # URLError and timeouts are OSErrors
                 if attempt == self.settings.retries:
                     raise RuntimeError(f"gateway request failed: {exc}") from exc
             time.sleep(2 ** attempt)

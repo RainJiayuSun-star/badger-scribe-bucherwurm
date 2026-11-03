@@ -110,6 +110,11 @@ def mask_illegible(labels, tokenizer) -> int:
     return masked
 
 
+def augmentation_key(row: dict[str, Any]) -> str:
+    """Seed key for a page's augmentation; repeated pages get one each, others keep the page ID."""
+    return f"{row['page_id']}#{row['repeat']}" if row.get("repeat") else row["page_id"]
+
+
 def collate_train(rows: list[dict[str, Any]], processor, device, epoch: int, augmenter, config: dict[str, Any] | None = None) -> dict[str, Any]:
     """Build labels that score assistant tokens only, not the instruction."""
     config = config or {}
@@ -117,7 +122,7 @@ def collate_train(rows: list[dict[str, Any]], processor, device, epoch: int, aug
     materialized = []
     for row in rows:
         with Image.open(row["image_path"]) as source:
-            image = augmenter.apply(source, row["page_id"], epoch) if augmenter else source.convert("RGB")
+            image = augmenter.apply(source, augmentation_key(row), epoch) if augmenter else source.convert("RGB")
         materialized.append((row, image, max_pixels_for(config, row.get("category"))))
     # Train on the cleaned target when finetune.prep supplied one.
     full_messages = [messages(image, row.get("target", row["text"]), pixels) for row, image, pixels in materialized]

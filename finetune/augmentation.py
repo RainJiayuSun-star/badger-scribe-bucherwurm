@@ -7,7 +7,7 @@ import random
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+from PIL import Image, ImageEnhance, ImageFilter
 
 
 def load_profile(path: Path) -> dict[str, Any]:
@@ -56,15 +56,14 @@ class OCRAugmenter:
             buffer.seek(0)
             result = Image.open(buffer).convert("RGB")
         if rng.random() < float(self.profile.get("noise_probability", 0.18)):
-            # Mild monochrome noise emulates scan grain without changing layout.
+            # Mild noise emulates scan grain; one noise map on all channels keeps the page's color.
             import numpy as np
 
-            gray = ImageOps.grayscale(result)
             amount = int(self.profile.get("noise_amount", 5))
             noise_rng = np.random.default_rng(int(rng.random() * (2**32 - 1)))
-            values = np.asarray(gray, dtype=np.int16)
-            mask = noise_rng.random(values.shape) < 0.035
-            noise = noise_rng.integers(-amount, amount + 1, size=values.shape)
-            values = np.clip(values + (noise * mask), 0, 255).astype(np.uint8)
-            result = Image.fromarray(values, mode="L").convert("RGB")
+            values = np.asarray(result, dtype=np.int16)
+            mask = noise_rng.random(values.shape[:2]) < 0.035
+            noise = noise_rng.integers(-amount, amount + 1, size=values.shape[:2])
+            values = np.clip(values + (noise * mask)[..., None], 0, 255).astype(np.uint8)
+            result = Image.fromarray(values)
         return result

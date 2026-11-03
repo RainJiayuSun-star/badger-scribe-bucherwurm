@@ -77,6 +77,61 @@ class HumanRepeatTests(unittest.TestCase):
         self.assertEqual([row["page_id"] for row in stages[0]], ["a", "a", "a", "b"])
         self.assertEqual([row["page_id"] for row in stage_rows({"train": train}, curriculum)[0]], ["a", "b"])
 
+    def test_each_repeat_gets_its_own_augmentation_key(self):
+        from finetune.train import stage_rows
+        from finetune.vlm import augmentation_key
+
+        train = [{"page_id": "a", "category": "survey_notes", "label_source": "human"},
+                 {"page_id": "b", "category": "survey_notes", "label_source": "silver_claude"}]
+        rows = stage_rows({"train": train}, {"stages": [["survey_notes"]]}, human_repeats=3)[0]
+        self.assertEqual([augmentation_key(row) for row in rows], ["a", "a#1", "a#2", "b"])
+        self.assertEqual(train[0], {"page_id": "a", "category": "survey_notes", "label_source": "human"})
+
+
+class HumanCerTests(unittest.TestCase):
+    def test_averages_human_pages_within_then_across_categories(self):
+        from finetune.train import human_cer
+
+        pages = [{"category": "a", "label_source": "human", "cer": 0.1},
+                 {"category": "a", "label_source": "human", "cer": 0.3},
+                 {"category": "b", "label_source": "human", "cer": 0.4},
+                 {"category": "b", "label_source": "silver_claude", "cer": 0.9}]
+        cer, count = human_cer(pages)
+        self.assertAlmostEqual(cer, 0.3)
+        self.assertEqual(count, 3)
+
+    def test_no_human_pages_is_none_not_zero(self):
+        from finetune.train import human_cer
+
+        self.assertEqual(human_cer([{"category": "a", "label_source": "silver_claude", "cer": 0.9}]), (None, 0))
+
+
+class AugmentationTests(unittest.TestCase):
+    PROFILE = {"probability": 1, "rotation_probability": 0, "contrast_probability": 0, "brightness_probability": 0,
+               "blur_probability": 0, "jpeg_probability": 0, "noise_probability": 1, "noise_amount": 5}
+
+    def _page(self):
+        from PIL import Image
+
+        return Image.new("RGB", (64, 64), (200, 40, 40))
+
+    def test_noise_keeps_the_page_in_color(self):
+        import numpy as np
+
+        from finetune.augmentation import OCRAugmenter
+
+        before = np.asarray(self._page())
+        after = np.asarray(OCRAugmenter(self.PROFILE, 1).apply(self._page(), "page", 0))
+        self.assertFalse((after == before).all(), "some grain was added")
+        self.assertTrue((after[..., 0] > after[..., 1] + 100).all(), "red stays red")
+
+    def test_different_keys_get_different_noise(self):
+        from finetune.augmentation import OCRAugmenter
+
+        augmenter = OCRAugmenter(self.PROFILE, 1)
+        self.assertEqual(augmenter.apply(self._page(), "page", 0).tobytes(), augmenter.apply(self._page(), "page", 0).tobytes())
+        self.assertNotEqual(augmenter.apply(self._page(), "page", 0).tobytes(), augmenter.apply(self._page(), "page#1", 0).tobytes())
+
 
 if __name__ == "__main__":
     unittest.main()

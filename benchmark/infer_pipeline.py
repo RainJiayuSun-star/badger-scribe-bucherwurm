@@ -18,7 +18,7 @@ import numpy as np
 from PIL import Image, ImageOps, ImageFilter
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import image_path, page_ids, read_train_rows, runs_dir, splits_dir
+from common import image_path, page_ids, pick_device, read_train_rows, runs_dir, splits_dir, write_predictions
 
 GERMAN_RECOGNIZER = "dh-unibe/trocr-kurrent"
 ENGLISH_RECOGNIZER = "microsoft/trocr-base-handwritten"
@@ -26,18 +26,6 @@ GERMAN_FALLBACKS = [
     "fhswf/TrOCR-kurrent",
     "microsoft/trocr-base-handwritten",
 ]
-
-
-def pick_device(requested: str) -> str:
-    import torch
-
-    if requested != "auto":
-        return requested
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
 
 
 def otsu_threshold(gray: np.ndarray) -> int:
@@ -275,14 +263,6 @@ def main() -> None:
         with pred_path.open(newline="", encoding="utf-8") as f:
             preds = {r["page_id"]: r["text"] for r in csv.DictReader(f)}
 
-    def write_preds():
-        with pred_path.open("w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=["page_id", "text"])
-            w.writeheader()
-            for pid in ids:
-                if pid in preds:
-                    w.writerow({"page_id": pid, "text": preds[pid]})
-
     page_times = []
     seg_stats = {"kraken": 0, "projection": 0}
     t0 = time.perf_counter()
@@ -314,7 +294,7 @@ def main() -> None:
             rec = {"page_id": pid, "sec": round(dt, 3), "n_lines": len(crops), "seg": seg, "chars": len(text)}
             logf.write(json.dumps(rec) + "\n")
             logf.flush()
-            write_preds()
+            write_predictions(pred_path, preds, ids)
             print(f"[{i}/{len(ids)}] {pid} {seg} {len(crops)} lines {dt:.1f}s {len(text)} chars")
 
     n = len(page_times)

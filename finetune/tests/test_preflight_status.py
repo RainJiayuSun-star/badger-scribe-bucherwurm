@@ -8,7 +8,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from finetune.preflight import check_data, check_disk, check_gpu, check_run_dir, run_checks
+from finetune.preflight import check_data, check_disk, check_gpu, check_run_dir, run_checks, run_is_live
 from finetune.status import summarize, verdict
 
 GIB = 1024**3
@@ -44,24 +44,43 @@ class PreflightTests(unittest.TestCase):
             run_dir = Path(tmp)
             (run_dir / "checkpoint-5").mkdir()
             (run_dir / "checkpoint-5" / "state.json").write_text("{}")
-            self.assertEqual(len(check_run_dir(run_dir, run_dir, resume=False, eval_only=False)), 1)
-            self.assertEqual(check_run_dir(run_dir, run_dir, resume=True, eval_only=False), [])
+            self.assertEqual(len(check_run_dir(run_dir, resume=False, eval_only=False)), 1)
+            self.assertEqual(check_run_dir(run_dir, resume=True, eval_only=False), [])
+
+    def test_a_finished_model_with_no_checkpoint_cannot_be_overwritten(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "best_adapter").mkdir()
+            for resume in (False, True):
+                problems = check_run_dir(run_dir, resume=resume, eval_only=False)
+                self.assertEqual(len(problems), 1)
+                self.assertIn("best_adapter", problems[0])
+            self.assertEqual(check_run_dir(run_dir, resume=False, eval_only=True), [])
 
     def test_a_live_run_with_the_same_id_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
-            status = {"phase": "training", "host": socket.gethostname(), "pid": os.getpid()}
+            now = datetime.now(timezone.utc).isoformat()
+            status = {"phase": "training", "host": socket.gethostname(), "pid": os.getppid(), "updated": now}
             (run_dir / "status.json").write_text(json.dumps(status))
-            self.assertEqual(len(check_run_dir(run_dir, run_dir, resume=True, eval_only=False)), 1)
+            self.assertEqual(len(check_run_dir(run_dir, resume=True, eval_only=False)), 1)
             status["phase"] = "finished"
             (run_dir / "status.json").write_text(json.dumps(status))
-            self.assertEqual(check_run_dir(run_dir, run_dir, resume=True, eval_only=False), [])
+            self.assertEqual(check_run_dir(run_dir, resume=True, eval_only=False), [])
+
+    def test_a_reused_process_id_does_not_block_a_resume(self):
+        now = datetime.now(timezone.utc)
+        live = {"phase": "training", "host": socket.gethostname(), "pid": os.getppid(), "updated": now.isoformat()}
+        self.assertTrue(run_is_live(live, now))
+        self.assertFalse(run_is_live({**live, "pid": os.getpid()}, now), "this launch itself")
+        self.assertFalse(run_is_live(live, now + timedelta(hours=1)), "a stale status")
+        self.assertFalse(run_is_live({**live, "host": "elsewhere"}, now))
 
     def test_all_problems_are_reported_together(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = {"data_root": str(Path(tmp) / "nowhere"), "min_free_disk_gib": 10**9, "min_free_gpu_gib": 12}
             with self.assertRaises(SystemExit) as stopped:
-                run_checks(config, Path(tmp) / "run", Path(tmp) / "run", False, False, lambda: (1 * GIB, 24 * GIB))
+                run_checks(config, Path(tmp) / "run", False, False, lambda: (1 * GIB, 24 * GIB))
         message = str(stopped.exception.code)
         self.assertIn("nothing was started", message)
         self.assertIn("train.csv", message)
@@ -71,7 +90,7 @@ class PreflightTests(unittest.TestCase):
     def test_good_setup_passes(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = {"data_root": str(_data_root(Path(tmp))), "min_free_disk_gib": 0.001, "min_free_gpu_gib": 12}
-            run_checks(config, Path(tmp) / "run", Path(tmp) / "run", False, False, lambda: (20 * GIB, 24 * GIB))
+            run_checks(config, Path(tmp) / "run", False, False, lambda: (20 * GIB, 24 * GIB))
 
 
 class StatusTests(unittest.TestCase):

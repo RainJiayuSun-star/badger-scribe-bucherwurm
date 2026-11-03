@@ -32,7 +32,7 @@ def main() -> int:
     for axis, key, title in [
         (axes[0, 0], "train_loss", "Training loss"),
         (axes[0, 1], "learning_rate", "Learning rate"),
-        (axes[1, 0], "val_macro_cer", "Human development macro CER"),
+        (axes[1, 0], "val_macro_cer", "Development macro CER"),
         (axes[1, 1], "peak_gpu_memory_mb", "Peak CUDA memory (MB)"),
     ]:
         x, y = values(key)

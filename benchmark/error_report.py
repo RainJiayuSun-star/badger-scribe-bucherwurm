@@ -21,7 +21,6 @@ import csv
 import difflib
 import glob
 import html
-import importlib.util
 import json
 import os
 import re
@@ -30,20 +29,12 @@ import unicodedata
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import data_root, image_path, read_train_rows, runs_dir  # noqa: E402
+from common import image_path, load_metric, read_train_rows, runs_dir  # noqa: E402
 
 csv.field_size_limit(10**8)
 _TAG_RE = re.compile(r"</?(?:u|del|ins)>")
 # Below this similarity a replaced span is shown as one deletion and one insertion.
 MIN_CHAR_SIMILARITY = 0.5
-
-
-def load_metric():
-    path = data_root() / "metric.py"
-    spec = importlib.util.spec_from_file_location("badger_metric", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def clean(text: str) -> str:

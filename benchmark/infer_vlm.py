@@ -14,7 +14,7 @@ import traceback
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import image_path, page_ids, read_metadata, read_train_rows, runs_dir
+from common import image_path, page_ids, pick_device, read_metadata, read_train_rows, runs_dir, write_predictions
 from prompts import build_prompt
 
 MODEL_ALIASES = {
@@ -41,22 +41,6 @@ DEEPSEEK_OCR_PROMPT = "Free OCR."
 
 def resolve_model(name: str) -> str:
     return MODEL_ALIASES.get(name.lower(), name)
-
-
-def pick_device(requested: str) -> str:
-    import torch
-
-    if requested != "auto":
-        if requested == "cuda" and not torch.cuda.is_available():
-            raise SystemExit("CUDA requested but not available")
-        if requested == "mps" and not torch.backends.mps.is_available():
-            raise SystemExit("MPS requested but not available")
-        return requested
-    if torch.cuda.is_available():
-        return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
 
 
 def pick_dtype(requested: str, device: str, model_id: str) -> str:
@@ -108,16 +92,6 @@ def load_existing_preds(path: Path) -> dict[str, str]:
         return {row["page_id"]: row["text"] for row in csv.DictReader(f)}
 
 
-def write_preds(path: Path, page_order: list[str], preds: dict[str, str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["page_id", "text"])
-        w.writeheader()
-        for pid in page_order:
-            if pid in preds:
-                w.writerow({"page_id": pid, "text": preds[pid]})
-
-
 def require_transformers_v4() -> None:
     """DeepSeek-OCR's remote code targets transformers 4.x and cannot run on 5.x.
 
@@ -137,81 +111,25 @@ def require_transformers_v4() -> None:
         )
 
 
-def restore_v4_config_defaults(config) -> int:
-    """Re-apply defaults that a transformers 4.x config __init__ would have set.
-
-    In 5.x the base __init__ rebuilds the instance dict, so attributes a remote
-    config assigns before calling super() are dropped and only config.json keys
-    survive. Reading the defaults back off each __init__ signature restores them.
-    """
-    import inspect
-
-    import transformers.configuration_utils as cfg_utils
-
-    # 5.x renamed PretrainedConfig to PreTrainedConfig.
-    base_config = getattr(cfg_utils, "PreTrainedConfig", None) or cfg_utils.PretrainedConfig
-
-    restored = 0
-    seen: set[int] = set()
-    stack = [config]
-    while stack:
-        cfg = stack.pop()
-        if id(cfg) in seen:
-            continue
-        seen.add(id(cfg))
-        for klass in type(cfg).__mro__:
-            init = klass.__dict__.get("__init__")
-            if init is None:
-                continue
-            for name, param in inspect.signature(init).parameters.items():
-                if param.default is not inspect.Parameter.empty and not hasattr(cfg, name):
-                    setattr(cfg, name, param.default)
-                    restored += 1
-        stack.extend(v for v in vars(cfg).values() if isinstance(v, base_config))
-    return restored
-
-
-def restore_vision_position_ids(model) -> None:
-    """The vision encoder registers position_ids as arange, but the checkpoint
-    omits it and 5.x re-initialises missing buffers, leaving indices that send
-    the position embedding lookup out of bounds."""
-    import torch
-
-    for module in model.modules():
-        num_positions = getattr(module, "num_positions", None)
-        if num_positions is None or not hasattr(module, "position_ids"):
-            continue
-        ids = torch.arange(num_positions, device=module.position_ids.device)
-        module.position_ids = ids.expand((1, -1))
-
-
 def load_deepseek_ocr(model_id: str, device: str):
     import torch
-    from transformers import AutoConfig, AutoModel, AutoTokenizer
+    from transformers import AutoModel, AutoTokenizer
 
     if device != "cuda":
         raise SystemExit("DeepSeek-OCR requires CUDA; its infer() hardcodes .cuda()")
 
     require_transformers_v4()
 
-    import transformers
-
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-    restore_v4_config_defaults(config)
-
-    dtype_kw = "dtype" if int(transformers.__version__.split(".")[0]) >= 5 else "torch_dtype"
     model = AutoModel.from_pretrained(
         model_id,
-        config=config,
         trust_remote_code=True,
         use_safetensors=True,
         low_cpu_mem_usage=True,
         attn_implementation="eager",
-        **{dtype_kw: torch.bfloat16},
+        torch_dtype=torch.bfloat16,
     )
     model = model.eval().cuda().to(torch.bfloat16)
-    restore_vision_position_ids(model)
     return model, tokenizer
 
 
@@ -417,8 +335,6 @@ def main() -> None:
             img = image_path(pid)
             if not img.exists():
                 print(f"[{i}/{len(ids)}] {pid} MISSING IMAGE {img}", file=sys.stderr)
-                preds[pid] = ""
-                write_preds(pred_path, ids, preds)
                 continue
             row = train_index.get(pid, {})
             meta = metadata.get(row.get("doc_id", ""), {}) if args.with_metadata else None
@@ -430,13 +346,11 @@ def main() -> None:
                     args.max_new_tokens, args.max_pixels,
                 )
             except Exception as e:
-                text = ""
+                # Not saved as a prediction, so a rerun tries this page again. It scores 1.0 until then.
                 err = f"{type(e).__name__}: {e}"
                 print(f"[{i}/{len(ids)}] {pid} FAIL {err}", file=sys.stderr)
                 logf.write(json.dumps({"page_id": pid, "error": err}) + "\n")
                 logf.flush()
-                preds[pid] = text
-                write_preds(pred_path, ids, preds)
                 continue
             dt = time.perf_counter() - t_page
             page_times.append(dt)
@@ -449,7 +363,7 @@ def main() -> None:
             }
             logf.write(json.dumps(rec) + "\n")
             logf.flush()
-            write_preds(pred_path, ids, preds)
+            write_predictions(pred_path, preds, ids)
             print(f"[{i}/{len(ids)}] {pid} {dt:.1f}s {len(text)} chars")
 
     wall = time.perf_counter() - t0
@@ -457,10 +371,11 @@ def main() -> None:
     n = len(page_times_sorted)
     summary = {
         **config,
-        "status": "ok",
+        "status": "ok" if len(preds) >= len(ids) else "partial",
         "load_sec": round(load_s, 3),
         "infer_wall_sec": round(wall, 3),
         "n_predicted": len(preds),
+        "n_missing": len(ids) - len(preds),
         "sec_per_page_mean": round(sum(page_times) / n, 3) if n else None,
         "sec_per_page_p50": page_times_sorted[n // 2] if n else None,
         "sec_per_page_p95": page_times_sorted[int(0.95 * (n - 1))] if n else None,

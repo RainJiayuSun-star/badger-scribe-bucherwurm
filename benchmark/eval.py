@@ -4,22 +4,13 @@ from __future__ import annotations
 
 import argparse
 import csv
-import importlib.util
 import json
 import statistics
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import data_root, results_dir, runs_dir, splits_dir
-
-
-def load_metric():
-    path = data_root() / "metric.py"
-    spec = importlib.util.spec_from_file_location("badger_scribe_metric", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+from common import data_root, load_metric, results_dir, runs_dir, splits_dir
 
 
 def solution_csv(split: str, explicit_path: Path | None = None) -> Path:

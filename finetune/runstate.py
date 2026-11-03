@@ -21,6 +21,7 @@ import os
 import shutil
 import signal
 import socket
+import sys
 import time
 import traceback
 from datetime import datetime, timezone
@@ -40,7 +41,7 @@ def _read_int(path: str) -> int | None:
     return int(text) if text.isdigit() else None
 
 
-def _gib(value: int | None) -> float | None:
+def gib(value: int | None) -> float | None:
     return None if value is None else round(value / 1024**3, 2)
 
 
@@ -53,23 +54,23 @@ def resources(paths: dict[str, Path]) -> dict[str, Any]:
                 snapshot["process_ram_gib"] = round(int(line.split()[1]) / 1024**2, 2)
     except OSError:
         pass
-    snapshot["container_ram_gib"] = _gib(_read_int("/sys/fs/cgroup/memory.current"))
-    snapshot["container_ram_limit_gib"] = _gib(_read_int("/sys/fs/cgroup/memory.max"))
+    snapshot["container_ram_gib"] = gib(_read_int("/sys/fs/cgroup/memory.current"))
+    snapshot["container_ram_limit_gib"] = gib(_read_int("/sys/fs/cgroup/memory.max"))
     try:
         import torch
 
         if torch.cuda.is_available():
             free, total = torch.cuda.mem_get_info()
-            snapshot["gpu_allocated_gib"] = _gib(torch.cuda.memory_allocated())
-            snapshot["gpu_peak_gib"] = _gib(torch.cuda.max_memory_allocated())
-            snapshot["gpu_free_gib"] = _gib(free)
-            snapshot["gpu_total_gib"] = _gib(total)
+            snapshot["gpu_allocated_gib"] = gib(torch.cuda.memory_allocated())
+            snapshot["gpu_peak_gib"] = gib(torch.cuda.max_memory_allocated())
+            snapshot["gpu_free_gib"] = gib(free)
+            snapshot["gpu_total_gib"] = gib(total)
     except Exception:  # noqa: BLE001 - diagnostics must never stop a run
         pass
     for name, path in paths.items():
         try:
             usage = shutil.disk_usage(path)
-            snapshot[f"disk_free_gib_{name}"] = _gib(usage.free)
+            snapshot[f"disk_free_gib_{name}"] = gib(usage.free)
         except OSError:
             pass
     return snapshot
@@ -88,10 +89,13 @@ class RunState:
         if not self.enabled:
             return
         record = {"time": _now(), "event": kind, **fields}
-        with (self.run_dir / "events.jsonl").open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, default=str) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        try:
+            with (self.run_dir / "events.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, default=str) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as error:   # a log must never stop a run
+            print(f"WARNING: could not write events.jsonl: {error}", file=sys.stderr, flush=True)
 
     def update(self, with_resources: bool = False, **fields: Any) -> None:
         if not self.enabled:
@@ -100,8 +104,11 @@ class RunState:
         if with_resources:
             self.status["resources"] = resources(self.watch)
         temporary = self.run_dir / "status.json.tmp"
-        temporary.write_text(json.dumps(self.status, indent=2, default=str) + "\n", encoding="utf-8")
-        os.replace(temporary, self.run_dir / "status.json")
+        try:
+            temporary.write_text(json.dumps(self.status, indent=2, default=str) + "\n", encoding="utf-8")
+            os.replace(temporary, self.run_dir / "status.json")
+        except OSError as error:   # a log must never stop a run
+            print(f"WARNING: could not write status.json: {error}", file=sys.stderr, flush=True)
 
     def phase(self, name: str, **fields: Any) -> None:
         """Enter a phase: logged as an event and as the current status, with resources."""
