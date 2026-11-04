@@ -138,6 +138,48 @@ How to read the last line of `events.jsonl`:
 | `signal` (SIGTERM) | Stopped from outside, for example the workspace was shut down or evicted. A pod's signal may not reach a run inside tmux; then see the last row |
 | anything else | Killed without warning (out of memory, node failure); `status.json` shows where it was |
 
+## Predicting the test set
+
+`finetune.predict` transcribes pages with one adapter per category. It loads and
+decodes the same way scoring does during training, so the prompt, image sizes and
+loop guard match. It runs on one GPU, without `accelerate launch`.
+
+First check that an adapter really loads. A LoRA that fails to switch gives the
+zero-shot score rather than an error, so score a fold the adapter held out and
+compare with what its training run logged for that fold:
+
+```bash
+python -m finetune.predict --config finetune/configs/churro-3b-bf16.yaml --run-id check-german \
+  --fold runs/folds/kade_112.json --adapter kade_letters=runs/finetune/<german run>/best_adapter
+```
+
+Then predict the test set, in tmux:
+
+```bash
+python -m finetune.predict --config finetune/configs/churro-3b-bf16.yaml --run-id submission-01 \
+  --adapter kade_letters=runs/finetune/<german run>/best_adapter \
+  --adapter survey_notes=runs/finetune/<english run>/best_adapter \
+  --adapter dominy_accounts=runs/finetune/<english run>/best_adapter
+```
+
+It refuses to start if a category has no adapter or an adapter folder is
+incomplete. Every page is saved as it finishes, so after a crash, rerun the same
+command and it continues. A rerun with other adapters or settings is refused,
+because it would mix two models in one submission. Progress shows in
+`python -m finetune.status <run-id>`.
+
+The run directory holds:
+
+| File | Contents |
+| --- | --- |
+| `submission.csv` | Appears only after a check that every page is there once, in `sample_submission.csv` order. Fold checks don't write it |
+| `predictions.csv` | Every finished page, rewritten after each one. This is what a rerun continues from |
+| `summary.json` | Peak GPU memory, wall time, git commit, model and adapter paths for the submission card, any empty pages, and the CER on a fold check |
+| `pages.jsonl` | Time, loop cut and output length per page |
+
+Pages with no text are reported, not redone: decoding is greedy, so a retry would
+give the same result, and they score CER 1.0.
+
 ## EFabric notes
 
 - `uv` is at `/opt/conda/bin/uv` and is not on the PATH of a non-interactive SSH command.
