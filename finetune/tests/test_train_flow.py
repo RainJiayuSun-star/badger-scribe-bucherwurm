@@ -154,6 +154,16 @@ class TrainingFlowTests(unittest.TestCase):
         self.assertEqual(self.evals, 2, "epoch 1 was not scored again")
         self.assertEqual((self.run_dir / "best_adapter" / "adapter.txt").read_text(), "1", "worse epoch 2 did not replace it")
 
+    def test_all_data_run_keeps_the_last_epoch_without_scoring(self):
+        ids = json.loads(self.fold.read_text())
+        self.fold.write_text(json.dumps({"name": "all_train", "eval_ids": [], "train_ids": ids["eval_ids"] + ids["train_ids"]}))
+        self.assertEqual(self._train(), 0)
+        self.assertEqual(self.evals, 0, "nothing is held out, so nothing is scored")
+        self.assertEqual(self._kinds()[-1], "finished")
+        saved = [e["epoch"] for e in self._events() if e["event"] == "best_adapter_saved"]
+        self.assertEqual(saved, [1, 2])
+        self.assertTrue((self.run_dir / "best_adapter" / "adapter.txt").exists())
+
     def test_write_errors_skip_the_save_and_training_carries_on(self):
         with mock.patch("finetune.train.save_checkpoint", side_effect=OSError("Disk quota exceeded")), \
                 mock.patch("finetune.train.save_best_adapter", side_effect=OSError("Disk quota exceeded")):

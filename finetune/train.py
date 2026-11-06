@@ -432,7 +432,19 @@ def run(args: argparse.Namespace, holder: dict[str, RunState]) -> int:
                     if global_step >= total_steps:
                         break
                 accelerator.wait_for_everyone()
-                if accelerator.is_main_process:
+                if accelerator.is_main_process and not dev_rows:
+                    # An all-data run holds nothing out, so the latest epoch is the adapter to keep.
+                    unwrapped = accelerator.unwrap_model(model)
+                    try:
+                        save_best_adapter(run_dir, unwrapped, processor)
+                    except OSError as error:
+                        state.event("best_adapter_skipped", epoch=epoch + 1, error=str(error))
+                        print(f"WARNING: kept the previous best_adapter: {error}", flush=True)
+                    else:
+                        state.event("best_adapter_saved", epoch=epoch + 1, cer=None)
+                    save_epoch_checkpoint(state, run_dir, global_step, unwrapped, optimizer, scheduler, checkpoint_need, int(config["keep_checkpoints"]),
+                                          {"global_step": global_step, "epoch": epoch + 1, "stage": stage_index + 1, "stage_epoch": stage_epoch + 1, "best_cer": best_cer})
+                elif accelerator.is_main_process:
                     unwrapped = accelerator.unwrap_model(model)
                     state.phase("evaluating", epoch=epoch + 1, step=global_step, eval_pages=len(dev_rows))
                     result = evaluate(unwrapped, processor, dev_rows, accelerator.device, config, run_dir / "development" / f"epoch-{epoch + 1}-preds.csv",
