@@ -99,6 +99,7 @@ class TrainingFlowTests(unittest.TestCase):
         argv = ["train", "--config", str(self.config), "--fold", str(self.fold), "--run-id", "flow", "--no-wandb", *extra]
         with mock.patch.object(sys, "argv", argv), mock.patch.dict(os.environ, {"ACCELERATE_USE_CPU": "true"}), \
                 mock.patch("torch.cuda.is_available", side_effect=chain([True], repeat(False))), \
+                mock.patch("torch.cuda.max_memory_allocated", return_value=0), \
                 mock.patch("finetune.train.load_model_and_processor", self._model), \
                 mock.patch("finetune.train.collate_train", self._collate), \
                 mock.patch("finetune.train.generate_texts", self._generate), \
