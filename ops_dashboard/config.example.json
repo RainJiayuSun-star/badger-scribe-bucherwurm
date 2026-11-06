@@ -1,0 +1,12 @@
+{
+  "ssh_host": "EFABRIC_HOST_IP",
+  "ssh_port": 2200,
+  "workspaces": [
+    {"queue": "gpu1", "user": "YOUR_FIRST_WORKSPACE_USER"},
+    {"queue": "gpu2", "user": "YOUR_SECOND_WORKSPACE_USER"}
+  ],
+  "remote_runs": "~/badger-scribe-bucherwurm/runs",
+  "local_runs": "runs",
+  "roles": {"root": "coordinator"},
+  "names": {"root": "Coordinator"}
+}

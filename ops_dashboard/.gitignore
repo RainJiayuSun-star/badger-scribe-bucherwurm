@@ -1,0 +1,8 @@
+# Per-developer settings and everything the dashboard generates
+config.json
+history_notes.json
+telemetry.sqlite3
+history_runs.json
+history.html
+server.log
+__pycache__/
