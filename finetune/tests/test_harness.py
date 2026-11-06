@@ -26,6 +26,116 @@ class ImageBudgetTests(unittest.TestCase):
         self.assertEqual(messages("page.jpg", "hello")[1]["content"][0]["text"], "hello")
 
 
+class FakeProcessor:
+    """Full chat = 10 tokens, prompt alone = 6, so tokens 6-9 are the target."""
+
+    class tokenizer:
+        pad_token_id = 0
+
+    def apply_chat_template(self, item, tokenize=False, add_generation_prompt=False):
+        return "prompt" if add_generation_prompt else "full"
+
+    def __call__(self, text, **kwargs):
+        import torch
+
+        n = 6 if text[0] == "prompt" else 10
+        return {"input_ids": torch.arange(1, n + 1).unsqueeze(0), "attention_mask": torch.ones((1, n), dtype=torch.long)}
+
+
+@unittest.skipUnless(HAS_TORCH, "torch is installed by the cuda extra")
+class BaseModelOptionTests(unittest.TestCase):
+    """image_longest_edge, prompt, prompt_first and target_logits_only (olmOCR); unset, nothing changes."""
+
+    OLMOCR = {"image_longest_edge": 1288, "prompt": "P", "prompt_first": True, "target_logits_only": True,
+              "max_pixels": 1000, "max_pixels_by_category": {"survey_notes": 4000}, "mask_illegible": False}
+
+    def collate(self, config, page):
+        from unittest import mock
+
+        from finetune import vlm
+
+        seen = []
+        with mock.patch.object(vlm, "_vision_inputs", side_effect=lambda batch, patch: seen.append(batch) or (None, None)):
+            batch = vlm.collate_train([{"page_id": "p", "image_path": str(page), "text": "t", "category": "dominy_accounts"}],
+                                      FakeProcessor(), "cpu", 0, None, config)
+        return batch, seen[0][0][0]["content"]
+
+    def page(self, size=(100, 200)):
+        import tempfile
+        from pathlib import Path
+
+        from PIL import Image
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "page.jpg"
+        Image.new("RGB", size, "white").save(path)
+        return path
+
+    def test_committed_configs_use_none_of_these_keys(self):
+        from pathlib import Path
+
+        from finetune.config import load_config
+
+        configs = [path for path in (Path(__file__).parents[1] / "configs").glob("*.yaml") if path.name != "curricula.yaml"]
+        self.assertTrue(configs)
+        for path in configs:
+            if path.name.startswith("olmocr"):
+                continue
+            config = load_config(path)
+            self.assertFalse({"image_longest_edge", "prompt", "prompt_first", "target_logits_only"} & set(config), path.name)
+
+    def test_unset_keeps_the_churro_prompt_image_and_labels(self):
+        from finetune.vlm import PROMPT, page_image
+
+        config = {"max_pixels": 1000, "max_pixels_by_category": {"survey_notes": 4000}, "mask_illegible": False}
+        self.assertEqual(page_image(config, "page.jpg", "dominy_accounts"), ("page.jpg", 1000))
+        self.assertEqual(messages("page.jpg", None, 1000, config), messages("page.jpg", None, 1000))
+        self.assertEqual(messages("page.jpg")[0]["content"][1], {"type": "text", "text": PROMPT})
+        page = self.page()
+        batch, content = self.collate(config, page)
+        self.assertEqual([part["type"] for part in content], ["image", "text"])
+        self.assertEqual((content[0]["image"].size, content[0]["max_pixels"], content[1]["text"]), ((100, 200), 1000, PROMPT))
+        self.assertNotIn("logits_to_keep", batch)
+        self.assertEqual(batch["labels"].tolist(), [[-100] * 6 + [7, 8, 9, 10]])
+
+    def test_olmocr_prompt_first_page_resized_and_logits_on_targets(self):
+        page = self.page()
+        batch, content = self.collate(self.OLMOCR, page)
+        self.assertEqual([part["type"] for part in content], ["text", "image"])
+        self.assertEqual(content[0]["text"], "P")
+        self.assertEqual(content[1]["image"].size, (644, 1288))     # upscaled to the longest edge
+        self.assertNotIn("max_pixels", content[1])
+        self.assertEqual(batch["logits_to_keep"], 5)                # last prompt token plus 4 targets
+        self.assertEqual(batch["labels"].tolist(), [[-100, 7, 8, 9, 10]])
+
+    def test_longest_edge_shrinks_and_skips_categories_with_their_own_budget(self):
+        from PIL import Image
+
+        from finetune.vlm import page_image
+
+        image, cap = page_image(self.OLMOCR, Image.new("RGB", (3000, 2000)), "dominy_accounts")
+        self.assertEqual((image.size, cap), ((1288, 859), None))
+        survey = Image.new("RGB", (3000, 2000))
+        self.assertEqual(page_image(self.OLMOCR, survey, "survey_notes"), (survey, 4000))
+
+    @unittest.skipUnless(importlib.util.find_spec("transformers"), "needs transformers")
+    def test_target_logits_give_the_same_loss(self):
+        import torch
+        from transformers import Qwen2Config, Qwen2ForCausalLM
+
+        torch.manual_seed(0)
+        model = Qwen2ForCausalLM(Qwen2Config(vocab_size=32, hidden_size=16, intermediate_size=32, num_hidden_layers=2,
+                                             num_attention_heads=2, num_key_value_heads=1))
+        ids = torch.randint(0, 32, (1, 12))
+        labels = ids.clone()
+        labels[:, :7] = -100
+        keep = 12 - 7 + 1
+        full = model(input_ids=ids, labels=labels).loss
+        short = model(input_ids=ids, labels=labels[:, -keep:], logits_to_keep=keep).loss
+        torch.testing.assert_close(short, full)
+
+
 class FakeTokenizer:
     vocab = {1: "as", 2: " it", 3: " ####", 4: " put", 5: "#"}
 

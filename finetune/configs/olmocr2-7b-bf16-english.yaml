@@ -1,0 +1,34 @@
+# olmOCR-2-7B-1025 bf16 LoRA trained on the two English categories, human pages x3.
+# Same settings as churro-3b-bf16-english.yaml except the base and what it needs: weights
+# from the read-only /models store at a pinned commit, the model card's prompt before the
+# image, the card's page size (longest side 1288 px) for account pages, logits on target
+# tokens only and a higher free-GPU check so the 7B fits a 24 GB A5000.
+model_name: olmocr2-7b-bf16-english
+model_id: /models/models--allenai--olmOCR-2-7B-1025/snapshots/e52d6f090b7a9007afffbbd6ce510876222fea93
+curriculum: dominy-survey
+quantization: none
+image_patch_size: 14
+max_pixels: 1003520            # not used by these two categories
+max_pixels_by_category:
+  survey_notes: 2007040        # survey keeps its 2 MP budget; image_longest_edge skips it
+image_longest_edge: 1288
+# olmocr.prompts.build_no_anchoring_v4_yaml_prompt, as finetune.screen_base used it.
+prompt: |-
+  Attached is one page of a document that you must process. Just return the plain text representation of this document as if you were reading it naturally. Convert equations to LateX and tables to HTML.
+  If there are any figures or charts, label them with the following markdown syntax ![Alt text describing the contents of the figure](page_startx_starty_width_height.png)
+  Return your output as markdown, with a front matter section on top specifying values for the primary_language, is_rotation_valid, rotation_correction, is_table, and is_diagram parameters.
+prompt_first: true
+target_logits_only: true
+min_free_gpu_gib: 20.0
+max_seq_length: 8192
+epochs: 3
+per_device_batch_size: 1
+effective_batch_size: 8
+learning_rate: 0.0001
+vision_learning_rate: 0.00002
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+adapter_policy: language_projector
+eval_max_new_tokens: 4096
+human_repeats: 3
