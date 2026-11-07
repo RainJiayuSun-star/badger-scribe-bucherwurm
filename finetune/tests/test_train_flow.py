@@ -164,6 +164,25 @@ class TrainingFlowTests(unittest.TestCase):
         self.assertEqual(saved, [1, 2])
         self.assertTrue((self.run_dir / "best_adapter" / "adapter.txt").exists())
 
+    def test_all_data_run_writes_strict_json_and_resumes(self):
+        def strict(path):  # json.loads accepts Infinity and NaN by default; other tools don't
+            return json.loads(path.read_text(), parse_constant=lambda name: self.fail(f"{path.name} contains {name}"))
+
+        ids = json.loads(self.fold.read_text())
+        self.fold.write_text(json.dumps({"name": "all_train", "eval_ids": [], "train_ids": ids["eval_ids"] + ids["train_ids"]}))
+        self.signal_at_batch = 14    # 6 pages x 2 repeats = 12 batches an epoch, so this is after epoch 1's checkpoint
+        with self.assertRaises(SystemExit):
+            self._train()
+        for path in self.run_dir.glob("checkpoint-*/state.json"):
+            self.assertIsNone(strict(path)["best_cer"])
+        self.signal_at_batch = None
+        self.assertEqual(self._train("--resume"), 0)
+        self.assertIn("resumed", self._kinds())
+        self.assertEqual(self._kinds()[-1], "finished")
+        self.assertIsNone(strict(self.run_dir / "status.json")["best_cer"])
+        for line in (self.run_dir / "events.jsonl").read_text().splitlines():
+            json.loads(line, parse_constant=lambda name: self.fail(f"events.jsonl contains {name}"))
+
     def test_write_errors_skip_the_save_and_training_carries_on(self):
         with mock.patch("finetune.train.save_checkpoint", side_effect=OSError("Disk quota exceeded")), \
                 mock.patch("finetune.train.save_best_adapter", side_effect=OSError("Disk quota exceeded")):

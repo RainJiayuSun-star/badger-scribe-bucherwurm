@@ -233,6 +233,11 @@ def trainable_groups(model, language_lr: float, vision_lr: float) -> list[dict[s
     return groups
 
 
+def json_cer(value: float) -> float | None:
+    """A best CER as written to status and checkpoint files: None until a held-out page is scored (JSON has no infinity)."""
+    return value if math.isfinite(value) else None
+
+
 def stage_rows(partition: dict[str, Any], curriculum: dict[str, Any], human_repeats: int = 1) -> list[list[dict[str, str]]]:
     stages = []
     for stage in curriculum["stages"]:
@@ -384,8 +389,9 @@ def run(args: argparse.Namespace, holder: dict[str, RunState]) -> int:
             resume_stage = int(saved.get("stage", 1)) - 1
             resume_stage_epoch = int(saved.get("stage_epoch", 0))
             # Without this a worse epoch after the resume would replace best_adapter.
-            best_cer = float(saved.get("best_cer", best_cer))
-            state.event("resumed", checkpoint=str(checkpoint), step=global_step, best_cer=best_cer)
+            if saved.get("best_cer") is not None:  # None: nothing scored yet, e.g. an all-data run
+                best_cer = float(saved["best_cer"])
+            state.event("resumed", checkpoint=str(checkpoint), step=global_step, best_cer=json_cer(best_cer))
         else:
             state.event("resume_requested_but_no_checkpoint", directory=str(run_dir))
     checkpoint_need = estimate_bytes(accelerator.unwrap_model(model)) + DISK_MARGIN_BYTES
@@ -443,7 +449,7 @@ def run(args: argparse.Namespace, holder: dict[str, RunState]) -> int:
                     else:
                         state.event("best_adapter_saved", epoch=epoch + 1, cer=None)
                     save_epoch_checkpoint(state, run_dir, global_step, unwrapped, optimizer, scheduler, checkpoint_need, int(config["keep_checkpoints"]),
-                                          {"global_step": global_step, "epoch": epoch + 1, "stage": stage_index + 1, "stage_epoch": stage_epoch + 1, "best_cer": best_cer})
+                                          {"global_step": global_step, "epoch": epoch + 1, "stage": stage_index + 1, "stage_epoch": stage_epoch + 1, "best_cer": json_cer(best_cer)})
                 elif accelerator.is_main_process:
                     unwrapped = accelerator.unwrap_model(model)
                     state.phase("evaluating", epoch=epoch + 1, step=global_step, eval_pages=len(dev_rows))
@@ -463,7 +469,7 @@ def run(args: argparse.Namespace, holder: dict[str, RunState]) -> int:
                             best_cer = result["val_macro_cer"]
                             state.event("best_adapter_saved", epoch=epoch + 1, cer=best_cer)
                     save_epoch_checkpoint(state, run_dir, global_step, unwrapped, optimizer, scheduler, checkpoint_need, int(config["keep_checkpoints"]),
-                                          {"global_step": global_step, "epoch": epoch + 1, "stage": stage_index + 1, "stage_epoch": stage_epoch + 1, "best_cer": best_cer})
+                                          {"global_step": global_step, "epoch": epoch + 1, "stage": stage_index + 1, "stage_epoch": stage_epoch + 1, "best_cer": json_cer(best_cer)})
                 accelerator.wait_for_everyone()
                 if global_step >= total_steps:
                     break
@@ -484,8 +490,9 @@ def run(args: argparse.Namespace, holder: dict[str, RunState]) -> int:
             holdout_rows = [dict(row, image_path=str(image_path(Path(config["data_root"]), row["page_id"]))) for row in rows if row["page_id"] in held_ids(Path(config["holdout"]))]
             holdout_result = evaluate(unwrapped, processor, holdout_rows, accelerator.device, config, run_dir / "preds.csv")
             (run_dir / "holdout_metrics.json").write_text(json.dumps(holdout_result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        print(f"completed {config['run_id']} with best development macro CER {best_cer:.4f}")
-    state.phase("finished", best_cer=best_cer)
+        scored = f"{best_cer:.4f}" if math.isfinite(best_cer) else "none (no held-out page was scored)"
+        print(f"completed {config['run_id']} with best development macro CER {scored}")
+    state.phase("finished", best_cer=json_cer(best_cer))
     return 0
 
 
