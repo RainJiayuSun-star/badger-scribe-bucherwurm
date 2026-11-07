@@ -79,12 +79,33 @@ def max_pixels_for(config: dict[str, Any], category: str | None) -> int:
     return int(by_category.get(category, config.get("max_pixels", 1280 * 28 * 28)))
 
 
-def messages(image: str | Path | Image.Image, text: str | None = None, max_pixels: int | None = None) -> list[dict[str, Any]]:
+def page_image(config: dict[str, Any], image: str | Path | Image.Image, category: str | None) -> tuple[Any, int | None]:
+    """The image and pixel cap for one page.
+
+    With `image_longest_edge` set (olmOCR's card: longest side 1288 px, upscaled when smaller), the
+    page is resized to it with LANCZOS, as finetune.screen_base did, and gets no cap; a category with
+    its own max_pixels_by_category entry keeps that budget instead. Unset, the page is unchanged.
+    """
+    edge = config.get("image_longest_edge")
+    if not edge or category in (config.get("max_pixels_by_category") or {}):
+        return image, max_pixels_for(config, category)
+    if not isinstance(image, Image.Image):
+        with Image.open(image) as source:
+            image = source.convert("RGB")
+    scale = int(edge) / max(image.size)
+    return image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale))), Image.LANCZOS), None
+
+
+def messages(image: str | Path | Image.Image, text: str | None = None, max_pixels: int | None = None,
+             config: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    config = config or {}
     image_value = str(image) if isinstance(image, Path) else image
     image_item: dict[str, Any] = {"type": "image", "image": image_value}
     if max_pixels:
         image_item["max_pixels"] = int(max_pixels)
-    content: list[dict[str, Any]] = [image_item, {"type": "text", "text": PROMPT}]
+    content: list[dict[str, Any]] = [image_item, {"type": "text", "text": config.get("prompt", PROMPT)}]
+    if config.get("prompt_first"):
+        content.reverse()
     result = [{"role": "user", "content": content}]
     if text is not None:
         result.append({"role": "assistant", "content": [{"type": "text", "text": text}]})
@@ -123,10 +144,10 @@ def collate_train(rows: list[dict[str, Any]], processor, device, epoch: int, aug
     for row in rows:
         with Image.open(row["image_path"]) as source:
             image = augmenter.apply(source, augmentation_key(row), epoch) if augmenter else source.convert("RGB")
-        materialized.append((row, image, max_pixels_for(config, row.get("category"))))
+        materialized.append((row, *page_image(config, image, row.get("category"))))
     # Train on the cleaned target when finetune.prep supplied one.
-    full_messages = [messages(image, row.get("target", row["text"]), pixels) for row, image, pixels in materialized]
-    prompt_messages = [messages(image, None, pixels) for _, image, pixels in materialized]
+    full_messages = [messages(image, row.get("target", row["text"]), pixels, config) for row, image, pixels in materialized]
+    prompt_messages = [messages(image, None, pixels, config) for _, image, pixels in materialized]
     full_texts = [processor.apply_chat_template(item, tokenize=False, add_generation_prompt=False) for item in full_messages]
     prompt_texts = [processor.apply_chat_template(item, tokenize=False, add_generation_prompt=True) for item in prompt_messages]
     images, videos = _vision_inputs(full_messages, patch)
@@ -150,6 +171,11 @@ def collate_train(rows: list[dict[str, Any]], processor, device, epoch: int, aug
         print(f"warning: {rows[0]['page_id']} truncated from {batch['input_ids'].shape[1]} to {max_len} tokens")
         for key in ("input_ids", "attention_mask", "labels"):
             batch[key] = batch[key][:, :max_len]
+    if config.get("target_logits_only"):
+        # Same loss, less memory: lm_head runs from the last prompt token on, not over the image tokens
+        # (full fp32 logits of a 3,000-token page take several GiB in the loss and its backward).
+        keep = batch["labels"].shape[1] - min(int(length) for length in prompt_lengths) + 1
+        batch["labels"], batch["logits_to_keep"] = batch["labels"][:, -keep:], keep
     return {key: value.to(device) if hasattr(value, "to") else value for key, value in batch.items()}
 
 
@@ -219,7 +245,8 @@ def generate_texts(model, processor, rows: list[dict[str, Any]], device, max_new
     outputs: list[str] = []
     infos: list[dict[str, int]] = []
     for row in rows:
-        item = messages(row["image_path"], None, max_pixels_for(config, row.get("category")))
+        image, pixels = page_image(config, row["image_path"], row.get("category"))
+        item = messages(image, None, pixels, config)
         text = processor.apply_chat_template(item, tokenize=False, add_generation_prompt=True)
         images, videos = _vision_inputs([item], patch)
         inputs = processor(text=[text], images=images, videos=videos, padding=True, return_tensors="pt")

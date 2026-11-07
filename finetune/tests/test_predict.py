@@ -65,6 +65,7 @@ class PredictTests(unittest.TestCase):
         self.all_adapters = [f"kade_letters={self.german}", f"survey_notes={self.english}", f"dominy_accounts={self.english}"]
         self.model = None
         self.model_loads = 0
+        self.loaded_bases = []
         self.decoded = []
         self.crash_on_decode = None
         self.texts = {}
@@ -94,6 +95,8 @@ class PredictTests(unittest.TestCase):
                 self.training = False
 
         self.model = FakeModel()
+        self.model.base = config["model_id"]
+        self.loaded_bases.append(config["model_id"])
         return self.model, SimpleNamespace()
 
     def _generate(self, model, processor, rows, device, max_new_tokens, config):
@@ -102,7 +105,8 @@ class PredictTests(unittest.TestCase):
         if len(self.decoded) == self.crash_on_decode:
             raise RuntimeError("CUDA out of memory")
         page = rows[0]
-        self.decoded.append({"page_id": page["page_id"], "adapter": model.loaded[model.active], "active": model.active, "training": model.training, "keys": set(page)})
+        self.decoded.append({"page_id": page["page_id"], "adapter": model.loaded[model.active], "active": model.active, "training": model.training, "keys": set(page),
+                             "base": getattr(model, "base", None), "config_base": config["model_id"]})
         return [self.texts.get(page["page_id"], f"text of {page['page_id']}")], [{"loop_cut": 1, "retry_used": 0}]
 
     def _predict(self, *extra, adapters=None, load=None, generate=None):
@@ -147,6 +151,37 @@ class PredictTests(unittest.TestCase):
         self.assertIn("git_version", summary)
         self.assertEqual(len((self.run_dir / "pages.jsonl").read_text().splitlines()), 4)
         self.assertEqual(self._events()[-1]["event"], "finished")
+
+    def test_a_second_base_decodes_its_category_after_the_first_and_resumes_alone(self):
+        olmocr = self.root / "olmocr.yaml"
+        olmocr.write_text("model_id: fake-olmocr\nquantization: none\neval_max_new_tokens: 4096\nmin_free_gpu_gib: 0\nprompt: read it\n")
+        self.crash_on_decode = 3    # the account page, the only one on the second base
+        with self.assertRaisesRegex(RuntimeError, "out of memory"):
+            self._predict("--base", f"dominy_accounts={olmocr}")
+        self.assertEqual(self.loaded_bases, ["fake", "fake-olmocr"])
+        churro_pages = [p for p, c, _ in PAGES if c != "dominy_accounts"]
+        self.assertEqual([(d["page_id"], d["base"], d["config_base"]) for d in self.decoded], [(p, "fake", "fake") for p in churro_pages])
+
+        self.crash_on_decode = None
+        self.decoded.clear()
+        self.assertEqual(self._predict("--base", f"dominy_accounts={olmocr}"), 0)
+        self.assertEqual(self.loaded_bases, ["fake", "fake-olmocr", "fake-olmocr"], "the rerun loads only the base with pages left")
+        self.assertEqual([(d["page_id"], d["base"], d["config_base"]) for d in self.decoded], [("dominy_003_p002", "fake-olmocr", "fake-olmocr")])
+        self.assertEqual([row["page_id"] for row in read_csv(self.run_dir / "submission.csv")], [p for p, _, _ in PAGES])
+        summary = self._summary()
+        self.assertEqual(summary["model_ids"], {"dominy_accounts": "fake-olmocr", "kade_letters": "fake", "survey_notes": "fake"})
+        settings = json.loads((self.run_dir / "config.json").read_text())
+        self.assertEqual(set(settings["bases"]), {"dominy_accounts"})
+        self.assertEqual(settings["bases"]["dominy_accounts"]["runs_root"], str(self.root / "runs"), "run folders stay --config's")
+        with self.assertRaisesRegex(SystemExit, "different settings"):
+            self._predict()
+
+    def test_refuses_a_missing_base_config(self):
+        with self.assertRaisesRegex(SystemExit, "--base dominy_accounts: .* is missing"):
+            self._predict("--base", f"dominy_accounts={self.root / 'nope.yaml'}")
+        with self.assertRaisesRegex(SystemExit, "--base 'dominy=x' must be CATEGORY=PATH"):
+            self._predict("--base", "dominy=x")
+        self.assertEqual(self.model_loads, 0)
 
     def test_refuses_a_category_with_no_adapter_before_loading_the_model(self):
         with self.assertRaisesRegex(SystemExit, "No --adapter for dominy_accounts, survey_notes"):

@@ -5,6 +5,10 @@
       --adapter survey_notes=<english adapter> \\
       --adapter dominy_accounts=<english adapter>
 
+Add --base CATEGORY=CONFIG to decode a category with another config's base model, prompt and
+image settings (e.g. olmOCR for the account books). Each base is loaded in turn and unloaded
+before the next, so one GPU only ever holds one model.
+
 Writes to runs/finetune/<run-id>/. Every page is saved as it finishes, so rerunning
 the same command after a crash continues where it stopped. submission.csv appears
 only once every page is there. Add --fold to score a held-out training document
@@ -15,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import json
 import subprocess
 import time
@@ -43,18 +48,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--run-id", required=True, help="Rerun with the same ID to continue after a crash")
     parser.add_argument("--adapter", action="append", required=True, metavar="CATEGORY=PATH", help="best_adapter folder for a category; repeat for each category")
+    parser.add_argument("--base", action="append", default=[], metavar="CATEGORY=CONFIG", help="decode a category with this config's base model instead of --config's; repeat for each category")
     parser.add_argument("--fold", type=Path, help="Fold file from finetune.folds: score its held-out training pages instead of predicting the test set")
     return parser.parse_args()
 
 
-def parse_adapters(items: list[str]) -> dict[str, Path]:
+def parse_adapters(items: list[str], flag: str = "--adapter") -> dict[str, Path]:
     adapters: dict[str, Path] = {}
     for item in items:
         category, _, path = item.partition("=")
         if category not in CATEGORIES or not path:
-            raise SystemExit(f"--adapter {item!r} must be CATEGORY=PATH, with CATEGORY one of {', '.join(CATEGORIES)}")
+            raise SystemExit(f"{flag} {item!r} must be CATEGORY=PATH, with CATEGORY one of {', '.join(CATEGORIES)}")
         if category in adapters:
-            raise SystemExit(f"--adapter names {category} twice")
+            raise SystemExit(f"{flag} names {category} twice")
         adapters[category] = Path(path).expanduser().resolve()
     return adapters
 
@@ -143,7 +149,15 @@ def run(args: argparse.Namespace, holder: dict[str, RunState]) -> int:
     data_root = Path(config["data_root"])
     run_dir = Path(config["runs_root"]) / args.run_id
     adapters = parse_adapters(args.adapter)
-    run_checks(config, run_dir, resume=True, eval_only=False)
+    bases = {}
+    for category, path in parse_adapters(args.base, "--base").items():
+        if not path.is_file():
+            raise SystemExit(f"--base {category}: {path} is missing; nothing was started.")
+        # Only the model side comes from the base config; data and run folders stay --config's.
+        bases[category] = {**load_config(path), "data_root": config["data_root"], "runs_root": config["runs_root"]}
+    # Every base must fit when it loads, so check the largest free-GPU need up front.
+    run_checks({**config, "min_free_gpu_gib": max(float(c["min_free_gpu_gib"]) for c in [config, *bases.values()])},
+               run_dir, resume=True, eval_only=False)
     check_inputs(data_root, adapters, args.fold)
 
     references: dict[str, str] = {}
@@ -157,12 +171,18 @@ def run(args: argparse.Namespace, holder: dict[str, RunState]) -> int:
     if categories - set(adapters):
         raise SystemExit(f"No --adapter for {', '.join(sorted(categories - set(adapters)))}; nothing was started.")
     adapters = {category: adapters[category] for category in sorted(categories)}
+    model_configs = {category: bases.get(category, config) for category in adapters}
+    # One group per base model, --config's first; each loads once.
+    groups: dict[str, list[str]] = {}
+    for category in sorted(adapters, key=lambda c: c in bases):
+        groups.setdefault(model_configs[category]["_config_path"], []).append(category)
     for page in pages:
         page["image_path"] = str(image_path(data_root, page["page_id"]))
     order = [page["page_id"] for page in pages]
 
     # Continuing with other settings would mix two models in one submission.
-    settings = resolved_config_json({**config, "adapters": adapters, "fold": args.fold.resolve() if args.fold else None})
+    settings = resolved_config_json({**config, "adapters": adapters, "fold": args.fold.resolve() if args.fold else None,
+                                     **({"bases": {category: bases[category] for category in adapters if category in bases}} if bases else {})})
     settings_path = run_dir / "config.json"
     if settings_path.is_file() and settings_path.read_text(encoding="utf-8") != settings:
         raise SystemExit(f"{run_dir} was started with different settings (see its config.json). Use a different --run-id.")
@@ -176,25 +196,30 @@ def run(args: argparse.Namespace, holder: dict[str, RunState]) -> int:
     page_log_path = run_dir / "pages.jsonl"
     predictions = read_completed(progress_path)
     pending = [page for page in pages if page["page_id"] not in predictions]
-    if pending:
+    heartbeat = Heartbeat(state) if pending else None
+    for group in groups.values():
+        todo = [page for page in pending if page["category"] in group]
+        if not todo:
+            continue
+        model_config = model_configs[group[0]]
         started = time.monotonic()
-        state.phase("loading_model", run_id=args.run_id, fold=args.fold.stem if args.fold else None, pending_pages=len(pending))
-        heartbeat = Heartbeat(state)
-        model, processor = load_model_and_processor(config, 0)
+        state.phase("loading_model", run_id=args.run_id, fold=args.fold.stem if args.fold else None, pending_pages=len(pending), model_id=model_config["model_id"])
+        model, processor = load_model_and_processor(model_config, 0)
         # shortcut: English loads once per category (about 0.1 GB extra); key by path if memory ever matters.
-        for category, path in adapters.items():
+        for category in group:
+            path = adapters[category]
             result = model.load_adapter(str(path), adapter_name=category, is_trainable=False)
             # PEFT only warns here, and the page would then decode with untrained weights.
             if result.missing_keys:
                 raise SystemExit(f"{path} is missing {len(result.missing_keys)} tensors this model needs, e.g. {result.missing_keys[0]}")
         # After the loads: each new adapter's dropout starts on, and generate_texts doesn't turn it off.
         model.eval()
-        state.event("model_loaded", seconds=round(time.monotonic() - started, 1))
+        state.event("model_loaded", seconds=round(time.monotonic() - started, 1), model_id=model_config["model_id"])
         state.phase("evaluating", eval_page=len(predictions), eval_pages=len(pages))
-        for page in pending:
+        for page in todo:
             model.set_adapter(page["category"])
             started = time.monotonic()
-            texts, infos = generate_texts(model, processor, [page], "cuda:0", int(config.get("eval_max_new_tokens", 2048)), config)
+            texts, infos = generate_texts(model, processor, [page], "cuda:0", int(model_config.get("eval_max_new_tokens", 2048)), model_config)
             predictions[page["page_id"]] = texts[0]
             write_predictions(progress_path, predictions, order)
             append_log(page_log_path, {"page_id": page["page_id"], "category": page["category"], "seconds": round(time.monotonic() - started, 2),
@@ -202,6 +227,10 @@ def run(args: argparse.Namespace, holder: dict[str, RunState]) -> int:
                                        # Reserved, not allocated: the submission card asks what the run actually used.
                                        "peak_gpu_gib": gib(torch.cuda.max_memory_reserved())})
             heartbeat(eval_page=len(predictions), eval_pages=len(pages))
+        # Free this base before the next loads (the rules allow several models, one at a time).
+        del model, processor
+        gc.collect()
+        torch.cuda.empty_cache()
 
     empty = check_predictions(progress_path, order)
     if empty:
@@ -220,6 +249,7 @@ def run(args: argparse.Namespace, holder: dict[str, RunState]) -> int:
         "peak_gpu_gib": max((record["peak_gpu_gib"] for record in records), default=None),
         "git_version": git_version(),
         "model_id": config["model_id"],
+        "model_ids": {category: model_configs[category]["model_id"] for category in adapters},
         "adapters": {category: str(path) for category, path in adapters.items()},
     }
     if args.fold:
