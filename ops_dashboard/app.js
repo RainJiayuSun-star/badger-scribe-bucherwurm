@@ -30,7 +30,7 @@ function gpu(g) {
   const current = evaluating ? s.eval_page : s.step, total = evaluating ? s.eval_pages : s.total_steps;
   const percent = total ? Math.min(100, 100 * (current || 0) / total) : null;
   const stale = g.stale || state(r || {}) === 'unknown';
-  return `<article class="gpu"><div class="gpuhead"><span class="unit">${esc(g.queue.toUpperCase())} / A5000</span>${badge(g.stale?'unknown':r?state(r):'queued',g.stale?'STALE / OFFLINE':r?(state(r)==='unknown'?'ACTIVITY UNCONFIRMED':s.phase):'NO ACTIVE RUN')}</div>
+  return `<article class="gpu"><div class="gpuhead"><span class="unit">${esc(g.queue.toUpperCase())} / ${esc((hw.name||'GPU').replace(/^NVIDIA\s+(RTX\s+)?/,''))}</span>${badge(g.stale?'unknown':r?state(r):'queued',g.stale?'STALE / OFFLINE':r?(state(r)==='unknown'?'ACTIVITY UNCONFIRMED':s.phase):'NO ACTIVE RUN')}</div>
     <div class="runname">${esc(r?.id || 'No job running')}</div><div class="gpumeta">${r?'Epoch '+esc(s.epoch??'—')+' · '+esc(s.phase):''}${r&&stale?' · last known state':''}</div>
     <div class="progress"><span style="width:${percent??0}%;${stale?'background:var(--muted)':''}"></span></div><div class="pair"><span>${total?(evaluating?'EVAL PAGE ':'STEP ')+esc(current||0)+' / '+esc(total):'Progress not reported'}</span><span>${percent===null?'':Math.floor(percent)+'%'}</span></div>
     <div class="hardware"><div><b>${hw.utilization??'—'}%</b><small>GPU UTILIZATION</small></div><div><b>${hw.used?(hw.used/1024).toFixed(1):'—'} / ${hw.total?(hw.total/1024).toFixed(0):'—'}</b><small>MEMORY · GiB</small></div><div><b>${g.runs.filter(r=>state(r)==='queued').length}</b><small>QUEUED</small></div></div>
@@ -89,22 +89,62 @@ function render(d) {
   drawRuns();
   updateTimers();
   $('todo').innerHTML=todoHtml();
-  const sub=submissionBox(d.submissions||[]);
-  $('subbox').innerHTML=sub.html;$('subbox').className='subbox '+sub.cls;
+  const sub=submissionBox(d.submissions||[],d.kaggle_connected);
+  $('subbox').innerHTML=sub.html+nextSubmission(d.gpus);$('subbox').className='subbox '+sub.cls;
   if($('waitlist').open)fillWaiting();
 }
 function todoHtml() {
   const tasks=(snapshot?.agents.tasks||[]).filter(t=>['waiting','blocked'].includes(t.display_state));
   return tasks.length?tasks.map(t=>`<div class="task"><strong>${esc(t.title)}</strong> ${badge(t.display_state)}<div>${esc(names[t.worker]||t.worker)} · ${esc(t.stage)} · reported ${time(t.reported_at)}</div>${t.note?'<div>'+esc(t.note)+'</div>':''}</div>`).join(''):'<div class="none">Nothing is awaiting action.</div>';
 }
-function submissionBox(subs) {
+// When a job should end, in epoch seconds: from its own pace once it has one, otherwise from the plan.
+function paceEnd(s) {
+  const now=Date.now()/1000;
+  if (s.phase==='training'&&s.step>0&&s.started) return now+(now-Date.parse(s.started)/1000)/s.step*(s.total_steps-s.step);
+  if (s.phase==='evaluating'&&s.eval_page>0&&s.phase_started) return now+(now-Date.parse(s.phase_started)/1000)/s.eval_page*(s.eval_pages-s.eval_page);
+  return null;
+}
+// Walks the queue up to the submission, adding each job's expected end. Returns null once a job has no estimate.
+function queueEnds(runs, upto) {
+  let cursor=Date.now()/1000, guessed=false;
+  const ends={};
+  for (const r of runs.slice(0, upto+1)) {
+    const st=state(r);
+    if (st==='complete'||st==='failed') continue;
+    if (st==='active') { const end=paceEnd(r.status||{}); if (end==null) { if (r.planned_minutes==null) return null; cursor=Math.max(cursor, Date.parse(r.status.started||0)/1000+r.planned_minutes*60); guessed=true; } else cursor=Math.max(cursor,end); }
+    else if (st==='queued') { if (r.planned_minutes==null) return {ends, cursor, guessed, unknownFrom:r.id}; cursor+=r.planned_minutes*60; guessed=true; }
+    ends[r.id]=cursor;
+  }
+  return {ends, cursor, guessed};
+}
+const at=s=>s==null?'—':new Date(s*1000).toLocaleTimeString('en-US',{timeZone:'America/Chicago',hour:'numeric',minute:'2-digit'})+' CST';
+function nextSubmission(gpus) {
+  for (const g of gpus) {
+    const i=g.runs.findIndex(r=>r.id.startsWith('submission-')&&['active','queued','unknown'].includes(state(r)));
+    if (i<0) continue;
+    const r=g.runs[i], unit=g.queue.toUpperCase();
+    const chain=queueEnds(g.runs,i), adapters=new Set((r.training||[]).map(t=>t.run));
+    const tuneEnds=chain?Object.entries(chain.ends).filter(([id])=>adapters.has(id)).map(([,end])=>end):[];
+    const finished=(r.training||[]).every(t=>t.phase==='finished');
+    const tuneEnd=finished?null:tuneEnds.length&&!chain.unknownFrom?Math.max(...tuneEnds):null;
+    const subEnd=chain&&!chain.unknownFrom?chain.ends[r.id]:null;
+    // "~" because each end time is an estimate; the countdown ticks every second
+    const line=(label,end,doneText)=>`<p>${label}: <b>${end?'~'+at(end):doneText}</b>${end?` · ~<b data-until="${new Date(end*1000).toISOString()}">—</b> left`:''}</p>`;
+    const where=state(r)==='active'?`running on ${unit}`:`queued on ${unit}`;
+    return `<p>Next: <b>${esc(r.id)}</b> · ${where}</p>`+line('Fine-tuning done',tuneEnd,finished?'done':'no estimate yet')+line('Submission.csv ready',subEnd,'no estimate yet');
+  }
+  return '<p>Next: no submission run is queued, so there is no time estimate.</p>';
+}
+function submissionBox(subs, kaggle) {
   const ready=subs.filter(s=>s.csv&&!s.uploaded), done=subs.filter(s=>s.uploaded);
   const last=done[done.length-1];
-  const lastLine=last?`<p>Last uploaded: <b>${esc(last.id)}</b>${last.public_score!=null?' · public score <b>'+Number(last.public_score).toFixed(3)+'</b>':' · public score not recorded yet'}</p>`:'<p>Nothing uploaded yet.</p>';
+  const score=s=>s.public_score!=null?' · public CER <b>'+Number(s.public_score).toFixed(3)+'</b>':s.kaggle_status?' · Kaggle is still scoring it':' · public CER not recorded yet';
+  const source=kaggle?`<p>Kaggle shows ${done.length} upload${done.length===1?'':'s'}.</p>`:'<p>Not connected to Kaggle (no API token in ~/.kaggle), so uploads come from history_notes.json.</p>';
+  const lastLine=last?`<p>Last uploaded: <b>${esc(last.id)}</b>${score(last)}</p>${last.evaluation?'<p>Evaluation: <b>'+esc(last.evaluation)+'</b></p>':''}${source}`:'<p>Nothing uploaded yet.</p>'+source;
   if(!ready.length) return {cls:'', html:`<h3>No new submission to upload</h3>${lastLine}`};
   const rows=ready.map(s=>{const problems=[s.on_mac?'':'not copied to the Mac yet',s.pages!=null&&s.pages!==208?s.pages+' of 208 pages':'',s.empty_pages?s.empty_pages+' empty pages':'',s.dirty?'recorded a modified commit, so it can\'t be a final entry':''].filter(Boolean);
     return `<p><b>${esc(s.id)}</b> · finished ${time(s.finished_at)} · ${s.pages??'?'} pages · commit ${esc(s.commit||'unknown')}${problems.length?' · <span style="color:var(--red)">'+esc(problems.join(', '))+'</span>':''}</p>`}).join('');
-  return {cls:'ready', html:`<h3>Ready to upload: ${ready.map(s=>esc(s.id)).join(', ')}</h3>${rows}<p>File: runs/finetune/&lt;id&gt;/submission.csv. After uploading, add the id to "submitted" in runs/ops-dashboard/history_notes.json, and its score to "public_scores" once Kaggle shows it. Kaggle allows 2 uploads a day.</p>${lastLine}`};
+  return {cls:'ready', html:`<h3>Ready to upload: ${ready.map(s=>esc(s.id)).join(', ')}</h3>${rows}<p>File: runs/finetune/&lt;id&gt;/submission.csv. After uploading, add the id to "submitted" in ops_dashboard/history_notes.json, and its score to "public_scores" once Kaggle shows it. Kaggle allows 2 uploads a day.</p>${lastLine}`};
 }
 function fillWaiting() { $('waitlist-body').innerHTML=todoHtml(); }
 function openWaiting(){fillWaiting();$('waitlist').showModal();}

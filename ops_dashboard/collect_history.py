@@ -64,9 +64,12 @@ def collect_run(folder):
            'adapters': adapters(summary.get('adapters')) or adapters(config.get('adapters'))}
     if isinstance(summary.get('empty_pages'), list):
         run['summary']['empty_pages'] = len(summary['empty_pages'])
+    metric_rows = lines(folder / 'metrics.jsonl')
     run['epochs'] = [{k: v for k, v in row.items() if isinstance(v, (int, float)) and
                       (k in ('epoch', 'elapsed_seconds', 'peak_gpu_memory_mb') or k.startswith('val_'))}
-                     for row in lines(folder / 'metrics.jsonl') if 'val_macro_cer' in row]
+                     for row in metric_rows if 'val_macro_cer' in row]
+    run['loss'] = [[row['step'], row['epoch'], round(row['train_loss'], 5)] for row in metric_rows
+                   if all(isinstance(row.get(k), (int, float)) for k in ('step', 'epoch', 'train_loss'))]
     events = lines(folder / 'events.jsonl')
     if not run['epochs']:  # a run that crashed can have evals in events.jsonl but no metrics.jsonl
         run['epochs'] = [{'epoch': e.get('epoch'), 'val_macro_cer': e['cer'], 'val_human_macro_cer': e.get('human_cer'),

@@ -65,6 +65,15 @@ def fetch():
     return None
 
 
+def update_cache(fresh):
+    """Merge a fresh run list into history_runs.json, keeping runs the workspace no longer has."""
+    cached = {r['id']: r for r in json.loads(CACHE.read_text())} if CACHE.exists() else {}
+    if fresh is not None:
+        cached.update({r['id']: r for r in fresh})
+        CACHE.write_text(json.dumps(list(cached.values())))
+    return cached
+
+
 def category(fold):
     fold = fold or ''
     return next((key for prefix, key in (('kade', 'kade_letters'), ('survey', 'survey_notes'), ('dominy', 'dominy_accounts'),
@@ -234,12 +243,9 @@ def main():
     parser.add_argument('--offline', action='store_true', help='use the cached run list without contacting EFabric')
     parser.add_argument('--no-open', action='store_true', help="build the page without opening it in the browser")
     args = parser.parse_args()
-    cached = {r['id']: r for r in json.loads(CACHE.read_text())} if CACHE.exists() else {}
     fresh = None if args.offline else fetch()
-    if fresh is not None:
-        cached.update({r['id']: r for r in fresh})  # keep runs the workspace no longer has
-        CACHE.write_text(json.dumps(list(cached.values())))
-    elif not cached:
+    cached = update_cache(fresh)
+    if not cached:
         raise SystemExit('EFabric is unreachable and there is no cache yet.')
     notes = json.loads(NOTES.read_text()) if NOTES.exists() else {}
     OUT.write_text(build(list(cached.values()), notes))
