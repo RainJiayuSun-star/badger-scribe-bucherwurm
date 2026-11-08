@@ -1,4 +1,4 @@
-# Fine-tuning
+# Fine-tuning and prediction: LoRA adapters for Churro-3B and olmOCR-2-7B
 
 The fine-tuning harness trains page-level Qwen-family vision-language models
 on Release 09 with CUDA, Accelerate, QLoRA, resumable checkpoints, and local
@@ -162,6 +162,22 @@ python -m finetune.predict --config finetune/configs/churro-3b-bf16.yaml --run-i
   --adapter dominy_accounts=runs/finetune/<english run>/best_adapter
 ```
 
+To decode a category with a second base model, add `--base CATEGORY=CONFIG`; that
+category then uses the config's model, prompt and image settings. The base models
+load one at a time, each freed before the next, so one GPU holds one model:
+
+```bash
+python -m finetune.predict --config finetune/configs/churro-3b-bf16.yaml --run-id submission-04 \
+  --adapter kade_letters=runs/finetune/<german run>/best_adapter \
+  --adapter survey_notes=runs/finetune/<english run>/best_adapter \
+  --adapter dominy_accounts=runs/finetune/<olmOCR run>/best_adapter \
+  --base dominy_accounts=finetune/configs/olmocr2-7b-bf16-english.yaml
+```
+
+The configs pin each base model to a Hugging Face commit (`revision`), so a rerun
+loads the same weights. A fold with nothing held out (`runs/folds/all_train.json`)
+keeps the last epoch's adapter, since there is nothing to score.
+
 It refuses to start if a category has no adapter or an adapter folder is
 incomplete. Every page is saved as it finishes, so after a crash, rerun the same
 command and it continues. A rerun with other adapters or settings is refused,
@@ -189,6 +205,9 @@ give the same result, and they score CER 1.0.
   full-size checkpoints there got two workspaces restarted, most likely by the pod's
   ephemeral-storage limit.
 - `scp` does not work on the workspace; copy single files with `ssh host 'cat > path' < path`.
+- Churro-3B and olmOCR-2-7B are in the read-only store at `/models`. Set
+  `HF_HUB_CACHE=/models HF_HUB_OFFLINE=1` so runs load them from there at the pinned
+  commits instead of downloading 23 GB into the home quota.
 
 After locking a candidate on the human development set, score it once on the
 frozen Release 09 holdout. This writes `preds.csv` and `holdout_metrics.json`

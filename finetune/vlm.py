@@ -30,9 +30,12 @@ def load_model_and_processor(config: dict[str, Any], local_rank: int):
             bnb_4bit_use_double_quant=True,
             bnb_4bit_compute_dtype=dtype,
         )
-    processor = AutoProcessor.from_pretrained(config["model_id"], trust_remote_code=True)
+    # A pinned revision makes a rerun load the same weights; HF_HUB_CACHE can point at a local copy (EFabric: /models).
+    revision = config.get("revision")
+    processor = AutoProcessor.from_pretrained(config["model_id"], revision=revision, trust_remote_code=True)
     model = ModelClass.from_pretrained(
         config["model_id"],
+        revision=revision,
         dtype=dtype,
         device_map={"": local_rank},
         trust_remote_code=True,

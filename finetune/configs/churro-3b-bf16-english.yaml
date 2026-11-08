@@ -1,6 +1,7 @@
 # Churro-3B bf16 LoRA trained on the two English categories, human pages x3.
 model_name: churro-3b-bf16-english
 model_id: stanford-oval/churro-3B
+revision: ca2150ea465d5a3d67818c50e234b9422619c75d
 curriculum: dominy-survey
 quantization: none
 image_patch_size: 14
