@@ -72,6 +72,17 @@ class BaseModelOptionTests(unittest.TestCase):
         Image.new("RGB", size, "white").save(path)
         return path
 
+    def test_submission_configs_load_a_pinned_public_model(self):
+        """Verification reruns these on other hardware: no machine-local path, and the exact weights we used."""
+        from pathlib import Path
+
+        from finetune.config import load_config
+
+        for name in ("churro-3b-bf16.yaml", "churro-3b-bf16-english.yaml", "olmocr2-7b-bf16-english.yaml"):
+            config = load_config(Path(__file__).parents[1] / "configs" / name)
+            self.assertRegex(config["model_id"], r"^[\w.-]+/[\w.-]+$", name)
+            self.assertRegex(str(config.get("revision")), r"^[0-9a-f]{40}$", name)
+
     def test_committed_configs_use_none_of_these_keys(self):
         from pathlib import Path
 

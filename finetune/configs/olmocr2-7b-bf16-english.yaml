@@ -1,10 +1,11 @@
 # olmOCR-2-7B-1025 bf16 LoRA trained on the two English categories, human pages x3.
 # Same settings as churro-3b-bf16-english.yaml except the base and what it needs: weights
-# from the read-only /models store at a pinned commit, the model card's prompt before the
-# image, the card's page size (longest side 1288 px) for account pages, logits on target
-# tokens only and a higher free-GPU check so the 7B fits a 24 GB A5000.
+# at a pinned commit, the model card's prompt before the image, the card's page size
+# (longest side 1288 px) for account pages, logits on target tokens only and a higher
+# free-GPU check so the 7B fits a 24 GB A5000.
 model_name: olmocr2-7b-bf16-english
-model_id: /models/models--allenai--olmOCR-2-7B-1025/snapshots/e52d6f090b7a9007afffbbd6ce510876222fea93
+model_id: allenai/olmOCR-2-7B-1025
+revision: e52d6f090b7a9007afffbbd6ce510876222fea93   # on EFabric: HF_HUB_CACHE=/models finds it without a download
 curriculum: dominy-survey
 quantization: none
 image_patch_size: 14

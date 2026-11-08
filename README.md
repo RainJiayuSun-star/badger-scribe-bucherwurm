@@ -1,24 +1,70 @@
-# Badger Scribe Project - UW Madison MLM26 Challenge Team bucherwurm
+# Bücherwurm: Badger Scribe transcription pipeline (UW–Madison MLM26)
 
-UW–Madison MLM26 / [Kaggle Badger Scribe](https://www.kaggle.com/competitions/badger-scribe): verbatim transcription of 19th-century archival pages with open-weight models.
+Team Bücherwurm's entry for [Kaggle Badger Scribe](https://www.kaggle.com/competitions/badger-scribe): verbatim transcription of 19th- and 20th-century handwritten archival pages with open-weight models, on one GPU.
 
 - **Challenge rules:** [ChallengeDescription.md](ChallengeDescription.md)
 - **Team workflow:** [CONTRIBUTING.md](CONTRIBUTING.md)
-- **Approaches:** [design.md](design.md)
-- **Metric definitions:** [measurements.md](measurements.md)
-- **Numbers from runs:** [results/](results/)
-- **Remote Churro pipeline:** [pipeline/README.md](pipeline/README.md)
-- **Fine-tuning (LoRA, leave-one-document-out folds):** [finetune/README.md](finetune/README.md)
+- **Fine-tuning and prediction:** [finetune/README.md](finetune/README.md)
+- **Operations dashboard:** [ops_dashboard/README.md](ops_dashboard/README.md)
+- **Approaches and metrics:** [design.md](design.md), [measurements.md](measurements.md), [results/](results/)
+
+## Submission pipeline
+
+Each page is transcribed by a vision-language model with a LoRA adapter for its
+category, chosen from the `category` column of `test.csv`:
+
+| Category | Base model (pinned commit) | Adapter |
+| --- | --- | --- |
+| German Kurrent letters (`kade_letters`) | `stanford-oval/churro-3B` @ `ca2150e` | LoRA on the language layers, projector and vision encoder, trained on all German training pages |
+| Survey field notes (`survey_notes`) | `stanford-oval/churro-3B` @ `ca2150e` | LoRA trained on all English training pages |
+| Account books (`dominy_accounts`) | `allenai/olmOCR-2-7B-1025` @ `e52d6f0` | LoRA trained on all English training pages |
+
+`finetune.predict` loads one base model at a time, decodes its categories and frees
+it before loading the next, so the whole run needs one GPU (peak 18.4 GB). Every
+model is open-weight and nothing is sent to an external service. Prediction sees only
+`page_id`, `doc_id` and `category`, never `label_source`. Choices were made on
+held-out training documents (see [finetune/README.md](finetune/README.md)), not on the leaderboard.
+
+### Reproduce a submission
+
+1. Install: `uv sync --extra cuda --extra finetune`, and put the competition data in
+   `badger-scribe-data/` (or set `BADGER_SCRIBE_DATA`).
+2. Download the adapters from the Hugging Face repo
+   [`bucherwurm-mlm26/bucherwurm-adapters`](https://huggingface.co/bucherwurm-mlm26/bucherwurm-adapters)
+   (published with the final submission):
+   `hf download bucherwurm-mlm26/bucherwurm-adapters --local-dir adapters`.
+   Its model card lists which folder goes with which category.
+3. Run the prediction. The base models download from Hugging Face at the pinned
+   commits in the configs; set `HF_HUB_CACHE` to use a local copy instead.
+
+```bash
+python -m finetune.predict --config finetune/configs/churro-3b-bf16.yaml --run-id submission \
+  --adapter kade_letters=adapters/<German folder> \
+  --adapter survey_notes=adapters/<survey folder> \
+  --adapter dominy_accounts=adapters/<account-book folder> \
+  --base dominy_accounts=finetune/configs/olmocr2-7b-bf16-english.yaml
+```
+
+The CSV lands in `runs/finetune/submission/submission.csv`, and `summary.json` next to
+it records the commit, models, adapters, peak GPU memory and wall time.
 
 ## Repository map
 
 | Directory | What it does |
 | --- | --- |
+| `finetune/` | LoRA fine-tuning of Churro-3B and olmOCR-2-7B (label cleaning, document-level folds, training, evaluation, repetition-loop guard) and `finetune.predict`, which writes submissions |
 | `benchmark/` | Zero-shot inference with local VLMs and OCR baselines, frozen holdout splits, scoring with the official `metric.py` |
-| `pipeline/` | Batch transcription through the BadgerBrain gateway (served Churro), with resumable output |
-| `finetune/` | LoRA fine-tuning of Churro-3B / Qwen-VL: label cleaning, document-level folds, training, evaluation, repetition-loop guard |
+| `pipeline/` | Early prototype: batch transcription through the BadgerBrain gateway (served Churro). Not the submitted pipeline |
+| `ops_dashboard/` | Local dashboard for GPU jobs, agents, runs and Kaggle submissions |
 | `splits/` | Saved validation page IDs (label text is rebuilt locally, never committed) |
 | `results/` | Committed benchmark tables |
+
+## License
+
+The code is MIT licensed (see `LICENSE`). The base models and adapters keep their
+own licenses: Churro-3B is under the Qwen Research License, olmOCR-2-7B under
+Apache-2.0. Competition data is not included; it is for non-commercial research in
+connection with the challenge.
 
 ## Requirements
 
@@ -29,9 +75,11 @@ UW–Madison MLM26 / [Kaggle Badger Scribe](https://www.kaggle.com/competitions/
 - Fine-tuning needs CUDA: `uv sync --extra cuda --extra finetune`. A bf16 LoRA on Churro-3B
   peaks at about 12 GB, so it fits one 24 GB A5000. See [finetune/README.md](finetune/README.md).
 
-## Remote Churro workflow: infer, then measure
+## Earlier prototype: remote Churro workflow, infer then measure
 
-Use the remote Churro pipeline in two explicit steps. The first writes
+This is how the team benchmarked before the local pipeline existed. It sends pages
+to a team gateway serving Churro, so it is not the submitted pipeline. Use it in
+two explicit steps. The first writes
 predictions; the second compares them with the frozen ground truth. Do not
 score Kaggle `test.csv`: it has no ground-truth text.
 

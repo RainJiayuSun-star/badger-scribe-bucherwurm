@@ -2,6 +2,7 @@
 # Survey spreads get a larger image budget than the other categories.
 model_name: churro-3b-bf16
 model_id: stanford-oval/churro-3B
+revision: ca2150ea465d5a3d67818c50e234b9422619c75d   # the commit every submission so far used
 curriculum: kade
 quantization: none
 image_patch_size: 14
