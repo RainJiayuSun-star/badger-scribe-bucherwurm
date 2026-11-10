@@ -1,4 +1,4 @@
-"""Qwen-family page-transcription model and batch helpers."""
+"""Page-transcription model and batch helpers."""
 
 from __future__ import annotations
 
@@ -115,7 +115,15 @@ def messages(image: str | Path | Image.Image, text: str | None = None, max_pixel
     return result
 
 
-def _vision_inputs(message_batch: list[list[dict[str, Any]]], patch_size: int = 14):
+def _chat_text(processor, item, add_generation_prompt: bool, config: dict[str, Any]) -> str:
+    extra = {"enable_thinking": False} if config.get("model_family") == "lighton" else {}
+    return processor.apply_chat_template(item, tokenize=False, add_generation_prompt=add_generation_prompt, **extra)
+
+
+def _vision_inputs(message_batch: list[list[dict[str, Any]]], patch_size: int = 14, model_family: str = "qwen"):
+    if model_family == "lighton":
+        # LightOn's processor owns its 2,048-token image budget; images are already materialized above.
+        return [[item["image"] for item in messages[0]["content"] if item["type"] == "image"] for messages in message_batch], None
     try:
         from qwen_vl_utils import process_vision_info
     except ImportError as exc:  # pragma: no cover
@@ -151,11 +159,12 @@ def collate_train(rows: list[dict[str, Any]], processor, device, epoch: int, aug
     # Train on the cleaned target when finetune.prep supplied one.
     full_messages = [messages(image, row.get("target", row["text"]), pixels, config) for row, image, pixels in materialized]
     prompt_messages = [messages(image, None, pixels, config) for _, image, pixels in materialized]
-    full_texts = [processor.apply_chat_template(item, tokenize=False, add_generation_prompt=False) for item in full_messages]
-    prompt_texts = [processor.apply_chat_template(item, tokenize=False, add_generation_prompt=True) for item in prompt_messages]
-    images, videos = _vision_inputs(full_messages, patch)
+    full_texts = [_chat_text(processor, item, False, config) for item in full_messages]
+    prompt_texts = [_chat_text(processor, item, True, config) for item in prompt_messages]
+    family = config.get("model_family", "qwen")
+    images, videos = _vision_inputs(full_messages, patch, family)
     batch = processor(text=full_texts, images=images, videos=videos, padding=True, return_tensors="pt")
-    prompt_images, prompt_videos = _vision_inputs(prompt_messages, patch)
+    prompt_images, prompt_videos = _vision_inputs(prompt_messages, patch, family)
     prompts = processor(text=prompt_texts, images=prompt_images, videos=prompt_videos, padding=True, return_tensors="pt")
     labels = batch["input_ids"].clone()
     labels[labels == processor.tokenizer.pad_token_id] = -100
@@ -250,8 +259,8 @@ def generate_texts(model, processor, rows: list[dict[str, Any]], device, max_new
     for row in rows:
         image, pixels = page_image(config, row["image_path"], row.get("category"))
         item = messages(image, None, pixels, config)
-        text = processor.apply_chat_template(item, tokenize=False, add_generation_prompt=True)
-        images, videos = _vision_inputs([item], patch)
+        text = _chat_text(processor, item, True, config)
+        images, videos = _vision_inputs([item], patch, config.get("model_family", "qwen"))
         inputs = processor(text=[text], images=images, videos=videos, padding=True, return_tensors="pt")
         inputs = {key: value.to(device) if hasattr(value, "to") else value for key, value in inputs.items()}
         decoded = _decode_once(model, processor, inputs, max_new_tokens, guard, None)
