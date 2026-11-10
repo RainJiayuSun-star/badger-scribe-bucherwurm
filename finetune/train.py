@@ -79,6 +79,27 @@ def gpu_info() -> list[dict[str, Any]]:
     ]
 
 
+def training_loss(model, batch: dict[str, Any], config: dict[str, Any]):
+    """Token cross-entropy on unmasked labels, with optional label smoothing and loss truncation.
+
+    loss_truncation drops that fraction of each batch's highest-loss tokens, the likeliest label errors.
+    """
+    import torch.nn.functional as F
+
+    smoothing = float(config.get("label_smoothing") or 0)
+    truncation = float(config.get("loss_truncation") or 0)
+    if not smoothing and not truncation:
+        return model(**batch).loss
+    logits = model(**{key: value for key, value in batch.items() if key != "labels"}).logits
+    targets = batch["labels"][:, 1:]
+    keep = targets != -100
+    # Upcast only the scored positions, not the whole vocabulary-wide logit tensor.
+    losses = F.cross_entropy(logits[:, :-1][keep].float(), targets[keep], label_smoothing=smoothing, reduction="none")
+    if truncation:
+        losses = losses.sort().values[: max(1, math.ceil(losses.numel() * (1 - truncation)))]
+    return losses.mean()
+
+
 class MetricWriter:
     def __init__(self, run_dir: Path, enabled_wandb: bool, config: dict[str, Any], accelerator):
         self.run_dir = run_dir
@@ -419,8 +440,8 @@ def run(args: argparse.Namespace, holder: dict[str, RunState]) -> int:
                 for raw_batch in loader:
                     batch = collate_train(raw_batch, processor, accelerator.device, epoch, augmenter, config)
                     with accelerator.accumulate(model):
-                        output = model(**batch)
-                        accelerator.backward(output.loss)
+                        loss = training_loss(model, batch, config)
+                        accelerator.backward(loss)
                         if accelerator.sync_gradients:
                             grad_norm = accelerator.clip_grad_norm_(trainable, float(config.get("max_grad_norm", 1.0)))
                         optimizer.step()
@@ -433,7 +454,7 @@ def run(args: argparse.Namespace, holder: dict[str, RunState]) -> int:
                     payload = {
                         "epoch": epoch + 1,
                         "stage": stage_index + 1,
-                        "train_loss": float(accelerator.gather(output.loss.detach()).mean().item()),
+                        "train_loss": float(accelerator.gather(loss.detach()).mean().item()),
                         "learning_rate": float(scheduler.get_last_lr()[0]),
                         "gradient_norm": float(grad_norm.item() if hasattr(grad_norm, "item") else grad_norm),
                         "examples_per_second": round(global_step * int(config["effective_batch_size"]) / elapsed, 3),

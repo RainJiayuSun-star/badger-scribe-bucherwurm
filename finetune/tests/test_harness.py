@@ -146,6 +146,32 @@ class BaseModelOptionTests(unittest.TestCase):
         short = model(input_ids=ids, labels=labels[:, -keep:], logits_to_keep=keep).loss
         torch.testing.assert_close(short, full)
 
+    @unittest.skipUnless(importlib.util.find_spec("transformers"), "needs transformers")
+    def test_loss_options_match_the_model_loss_and_drop_the_worst_tokens(self):
+        import torch
+        from transformers import Qwen2Config, Qwen2ForCausalLM
+
+        from finetune.train import training_loss
+
+        torch.manual_seed(0)
+        model = Qwen2ForCausalLM(Qwen2Config(vocab_size=32, hidden_size=16, intermediate_size=32, num_hidden_layers=2,
+                                             num_attention_heads=2, num_key_value_heads=1))
+        ids = torch.randint(0, 32, (1, 12))
+        labels = ids.clone()
+        labels[:, :3] = -100
+        labels[:, 8] = -100  # a masked `#` token inside the target
+        batch = {"input_ids": ids, "labels": labels[:, -10:], "logits_to_keep": 10}
+        full = model(**batch).loss
+        # Truncating a vanishing fraction keeps every token, so the custom path must equal the model's own loss.
+        torch.testing.assert_close(training_loss(model, batch, {"loss_truncation": 1e-9}), full)
+        logits = model(input_ids=ids, logits_to_keep=10).logits[0, :-1]
+        targets = labels[0, -9:]
+        per_token = torch.nn.functional.cross_entropy(logits[targets != -100], targets[targets != -100], reduction="none")
+        self.assertEqual(per_token.numel(), 8)
+        torch.testing.assert_close(training_loss(model, batch, {"loss_truncation": 0.5}), per_token.sort().values[:4].mean())
+        smoothed = torch.nn.functional.cross_entropy(logits[targets != -100], targets[targets != -100], label_smoothing=0.1)
+        torch.testing.assert_close(training_loss(model, batch, {"label_smoothing": 0.1}), smoothed)
+
 
 class FakeTokenizer:
     vocab = {1: "as", 2: " it", 3: " ####", 4: " put", 5: "#"}
