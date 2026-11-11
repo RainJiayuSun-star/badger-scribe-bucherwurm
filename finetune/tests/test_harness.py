@@ -42,6 +42,13 @@ class FakeProcessor:
         return {"input_ids": torch.arange(1, n + 1).unsqueeze(0), "attention_mask": torch.ones((1, n), dtype=torch.long)}
 
 
+class FakeLightOnProcessor(FakeProcessor):
+    def apply_chat_template(self, item, tokenize=False, add_generation_prompt=False, enable_thinking=True):
+        if enable_thinking:
+            raise AssertionError("LightOn must disable thinking")
+        return super().apply_chat_template(item, tokenize, add_generation_prompt)
+
+
 @unittest.skipUnless(HAS_TORCH, "torch is installed by the cuda extra")
 class BaseModelOptionTests(unittest.TestCase):
     """image_longest_edge, prompt, prompt_first and target_logits_only (olmOCR); unset, nothing changes."""
@@ -55,10 +62,16 @@ class BaseModelOptionTests(unittest.TestCase):
         from finetune import vlm
 
         seen = []
-        with mock.patch.object(vlm, "_vision_inputs", side_effect=lambda batch, patch: seen.append(batch) or (None, None)):
+        with mock.patch.object(vlm, "_vision_inputs", side_effect=lambda batch, patch, family: seen.append(batch) or (None, None)):
             batch = vlm.collate_train([{"page_id": "p", "image_path": str(page), "text": "t", "category": "dominy_accounts"}],
                                       FakeProcessor(), "cpu", 0, None, config)
         return batch, seen[0][0][0]["content"]
+
+    def collate_lighton(self, config, page):
+        from finetune import vlm
+
+        return vlm.collate_train([{"page_id": "p", "image_path": str(page), "text": "t", "category": "dominy_accounts"}],
+                                 FakeLightOnProcessor(), "cpu", 0, None, config)
 
     def page(self, size=(100, 200)):
         import tempfile
@@ -78,7 +91,8 @@ class BaseModelOptionTests(unittest.TestCase):
 
         from finetune.config import load_config
 
-        for name in ("churro-3b-bf16.yaml", "churro-3b-bf16-english.yaml", "olmocr2-7b-bf16-english.yaml"):
+        for name in ("churro-3b-bf16.yaml", "churro-3b-bf16-english.yaml", "olmocr2-7b-bf16-english.yaml",
+                     "lighton3-4b-yale-english.yaml"):
             config = load_config(Path(__file__).parents[1] / "configs" / name)
             self.assertRegex(config["model_id"], r"^[\w.-]+/[\w.-]+$", name)
             self.assertRegex(str(config.get("revision")), r"^[0-9a-f]{40}$", name)
@@ -91,7 +105,7 @@ class BaseModelOptionTests(unittest.TestCase):
         configs = [path for path in (Path(__file__).parents[1] / "configs").glob("*.yaml") if path.name != "curricula.yaml"]
         self.assertTrue(configs)
         for path in configs:
-            if path.name.startswith("olmocr"):
+            if path.name.startswith(("olmocr", "lighton")):
                 continue
             config = load_config(path)
             self.assertFalse({"image_longest_edge", "prompt", "prompt_first", "target_logits_only"} & set(config), path.name)
@@ -145,6 +159,50 @@ class BaseModelOptionTests(unittest.TestCase):
         full = model(input_ids=ids, labels=labels).loss
         short = model(input_ids=ids, labels=labels[:, -keep:], logits_to_keep=keep).loss
         torch.testing.assert_close(short, full)
+
+    @unittest.skipUnless(importlib.util.find_spec("transformers"), "needs transformers")
+    def test_lighton_collate_target_logits_give_the_same_loss(self):
+        import torch
+        from transformers import Qwen2Config, Qwen2ForCausalLM
+
+        config = {"model_family": "lighton", "prompt": "P", "target_logits_only": True,
+                  "mask_illegible": False, "max_seq_length": 8192}
+        batch = self.collate_lighton(config, self.page())
+        self.assertEqual(batch["labels"].tolist(), [[-100, 7, 8, 9, 10]])
+        torch.manual_seed(0)
+        model = Qwen2ForCausalLM(Qwen2Config(vocab_size=32, hidden_size=16, intermediate_size=32, num_hidden_layers=2,
+                                             num_attention_heads=2, num_key_value_heads=1))
+        full_labels = batch["input_ids"].clone()
+        full_labels[:, :6] = -100
+        full = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], labels=full_labels).loss
+        short = model(**batch).loss
+        torch.testing.assert_close(short, full)
+
+    @unittest.skipUnless(importlib.util.find_spec("transformers"), "needs transformers")
+    def test_loss_options_match_the_model_loss_and_drop_the_worst_tokens(self):
+        import torch
+        from transformers import Qwen2Config, Qwen2ForCausalLM
+
+        from finetune.train import training_loss
+
+        torch.manual_seed(0)
+        model = Qwen2ForCausalLM(Qwen2Config(vocab_size=32, hidden_size=16, intermediate_size=32, num_hidden_layers=2,
+                                             num_attention_heads=2, num_key_value_heads=1))
+        ids = torch.randint(0, 32, (1, 12))
+        labels = ids.clone()
+        labels[:, :3] = -100
+        labels[:, 8] = -100  # a masked `#` token inside the target
+        batch = {"input_ids": ids, "labels": labels[:, -10:], "logits_to_keep": 10}
+        full = model(**batch).loss
+        # Truncating a vanishing fraction keeps every token, so the custom path must equal the model's own loss.
+        torch.testing.assert_close(training_loss(model, batch, {"loss_truncation": 1e-9}), full)
+        logits = model(input_ids=ids, logits_to_keep=10).logits[0, :-1]
+        targets = labels[0, -9:]
+        per_token = torch.nn.functional.cross_entropy(logits[targets != -100], targets[targets != -100], reduction="none")
+        self.assertEqual(per_token.numel(), 8)
+        torch.testing.assert_close(training_loss(model, batch, {"loss_truncation": 0.5}), per_token.sort().values[:4].mean())
+        smoothed = torch.nn.functional.cross_entropy(logits[targets != -100], targets[targets != -100], label_smoothing=0.1)
+        torch.testing.assert_close(training_loss(model, batch, {"label_smoothing": 0.1}), smoothed)
 
 
 class FakeTokenizer:
