@@ -1,0 +1,67 @@
+# Yale's LightOnOCR-3-4B fine-tune, trained on both English categories with human pages x3.
+# The processor carries the model card's 2,048-visual-token (about 2.1 MP) image budget.
+model_name: lighton3-4b-yale-english
+model_id: yale-cultural-heritage/LightOnOCR-3-4B-cultural-heritage-eng
+revision: 316da7f8a94929c3da9157d3fce05626ee6d38cb
+model_family: lighton
+curriculum: dominy-survey
+quantization: none
+image_patch_size: 16
+prompt: |-
+  Transcribe the handwritten text in this image exactly as written, following Smithsonian Transcription Center style conventions.
+
+  PRESERVE EXACTLY
+  - Original spelling, grammar, capitalisation, punctuation, abbreviations, and word order.
+  - Line breaks: each line of the manuscript is one line of the transcription.
+  - Do NOT modernise, correct, or interpret anything.
+
+  META-MARKUP (always in DOUBLE brackets)
+  - Struck-through / deleted text:
+      I really [[strikethrough]]hate[[/strikethrough]] don't like...
+  - Illegible or uncertain readings:
+      [[?]]                      one completely unreadable word
+      [[best guess?]]            an uncertain reading (include the guess)
+  - Physical condition of the document:
+      [[damage]]  [[stain]]  [[torn]]  [[faded]]  [[illegible]]
+  - Non-text items (still transcribe any caption near them):
+      [[image]]  [[stamp]]  [[signature]]  [[seal]]  [[sketch]]
+  - Marginalia: open with a direction tag, then the text, then close with [[/margin]]:
+      [[left margin]]Note on the side[[/margin]]
+      [[right margin]] ... [[/margin]]
+      [[top margin]] ... [[/margin]]
+      [[bottom margin]] ... [[/margin]]
+  - Tables / columned data: start with an "[[X columned table]]" line (X = column count), then one row per line with "|" as the column separator. Use "|   |" (pipes with spaces) for empty cells:
+      [[3 columned table]]
+      | Name | Date | Note |
+      | Smith | 1852 | sent |
+      |   | 1853 |   |
+  - Ditto marks ("): replace with the actual word they reference. If the reference is unclear, write [[ditto for ??]].
+
+  INLINE (NO brackets)
+  - Inserted / interlinear text (words written above or below the line): integrate into the sentence in natural reading order. Do NOT use carets (^) or any other marker.
+  - Superscript and subscript: write as plain inline text. For example "2nd" not "2^nd", "McDonald" not "Mc^Donald".
+
+  ABBREVIATION EXPANSION (SINGLE brackets only — this is the only single-bracket usage)
+  - Expand contracted or abbreviated words inside the word: y[ou]r, w[ith], M[iste]r.
+
+  DO NOT
+  - Indicate font style (no markers for bold, italic, underline).
+  - Mark page breaks, page numbers, pre-printed text, or signature blocks unless this prompt explicitly tells you to.
+  - Add commentary, introduction, or explanation.
+
+  OUTPUT
+  - The transcription only.
+target_logits_only: true
+min_free_gpu_gib: 20.0
+max_seq_length: 8192
+epochs: 3
+per_device_batch_size: 1
+effective_batch_size: 8
+learning_rate: 0.0001
+vision_learning_rate: 0.00002
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+adapter_policy: language_projector
+eval_max_new_tokens: 4096
+human_repeats: 3
