@@ -263,6 +263,31 @@ class Qwen38Tests(unittest.TestCase):
         self.assertNotIn("enable_thinking", _chat_text(Processor(), [], True, {}))
 
 
+class ScreenGatewayTests(unittest.TestCase):
+    def test_refuses_test_pages_and_keeps_the_image_budget(self):
+        import base64
+        import io
+        import tempfile
+        from pathlib import Path
+
+        from PIL import Image
+
+        from finetune.screen_gateway import page_url, refuse_test_pages
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "test.csv").write_text("page_id,doc_id\nkade_009_p001,kade_009\n", encoding="utf-8")
+            refuse_test_pages({"kade_103_p001"}, root)
+            with self.assertRaises(SystemExit):
+                refuse_test_pages({"kade_103_p001", "kade_009_p001"}, root)
+            Image.new("RGB", (3063, 2589), "white").save(root / "page.jpg")
+            url, (width, height) = page_url(root / "page.jpg", 1310720)
+        self.assertEqual((width % 32, height % 32), (0, 0))
+        self.assertLessEqual(width * height, 1310720)
+        with Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1]))) as sent:
+            self.assertEqual(sent.size, (width, height))
+
+
 class FakeTokenizer:
     vocab = {1: "as", 2: " it", 3: " ####", 4: " put", 5: "#"}
 
