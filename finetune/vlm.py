@@ -10,6 +10,33 @@ from PIL import Image
 PROMPT = "Transcribe every visible text character exactly as written. Preserve spelling, case, punctuation, and reading order. Output only the transcription."
 
 
+def lora_targets(model, config: dict[str, Any]) -> list[str]:
+    """Names of the Linear modules that get a LoRA adapter."""
+    import torch
+
+    language_suffixes = {"q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"}
+    if config.get("model_family") == "qwen3_5":
+        # 48 of Qwen3.8-27B's 64 layers use linear attention, which has none of the suffixes above.
+        language_suffixes |= {"in_proj_qkv", "in_proj_z", "out_proj"}
+    targets = []
+    for name, module in model.named_modules():
+        if not isinstance(module, torch.nn.Linear):
+            continue
+        suffix = name.rsplit(".", 1)[-1]
+        is_visual = name.startswith("visual.") or ".visual." in name
+        is_projector = "merger" in name or "projector" in name
+        if suffix in language_suffixes and not is_visual:
+            targets.append(name)
+        elif is_projector:
+            targets.append(name)
+        elif config.get("adapter_policy") == "vision_inclusive" and is_visual and suffix in {"qkv", "proj"}:
+            targets.append(name)
+    targets = sorted(set(targets))
+    if not targets:
+        raise RuntimeError("no LoRA target modules found; inspect this model's module names")
+    return targets
+
+
 def load_model_and_processor(config: dict[str, Any], local_rank: int):
     import torch
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
@@ -42,29 +69,14 @@ def load_model_and_processor(config: dict[str, Any], local_rank: int):
         **extra,
     )
     model.config.use_cache = False
-    if mode == "4bit":
+    # prepare_model_for_kbit_training casts unquantized weights to fp32: about 10 GiB more on Qwen3.8-27B.
+    if mode == "4bit" and config.get("model_family") != "qwen3_5":
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
     else:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     if hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
-    language_suffixes = {"q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"}
-    targets = []
-    for name, module in model.named_modules():
-        if not isinstance(module, torch.nn.Linear):
-            continue
-        suffix = name.rsplit(".", 1)[-1]
-        is_visual = name.startswith("visual.") or ".visual." in name
-        is_projector = "merger" in name or "projector" in name
-        if suffix in language_suffixes and not is_visual:
-            targets.append(name)
-        elif is_projector:
-            targets.append(name)
-        elif config.get("adapter_policy") == "vision_inclusive" and is_visual and suffix in {"qkv", "proj"}:
-            targets.append(name)
-    targets = sorted(set(targets))
-    if not targets:
-        raise RuntimeError("no LoRA target modules found; inspect this model's module names")
+    targets = lora_targets(model, config)
     lora = LoraConfig(
         r=int(config.get("lora_rank", 16)),
         lora_alpha=int(config.get("lora_alpha", 32)),
@@ -116,7 +128,8 @@ def messages(image: str | Path | Image.Image, text: str | None = None, max_pixel
 
 
 def _chat_text(processor, item, add_generation_prompt: bool, config: dict[str, Any]) -> str:
-    extra = {"enable_thinking": False} if config.get("model_family") == "lighton" else {}
+    # Qwen3.8's template thinks by default: it adds a reasoning system prompt and leaves <think> open.
+    extra = {"enable_thinking": False} if config.get("model_family") in {"lighton", "qwen3_5"} else {}
     return processor.apply_chat_template(item, tokenize=False, add_generation_prompt=add_generation_prompt, **extra)
 
 
