@@ -92,7 +92,7 @@ class BaseModelOptionTests(unittest.TestCase):
         from finetune.config import load_config
 
         for name in ("churro-3b-bf16.yaml", "churro-3b-bf16-english.yaml", "olmocr2-7b-bf16-english.yaml",
-                     "lighton3-4b-yale-english.yaml"):
+                     "lighton3-4b-yale-english.yaml", "qwen38-27b-4bit-english.yaml"):
             config = load_config(Path(__file__).parents[1] / "configs" / name)
             self.assertRegex(config["model_id"], r"^[\w.-]+/[\w.-]+$", name)
             self.assertRegex(str(config.get("revision")), r"^[0-9a-f]{40}$", name)
@@ -105,7 +105,7 @@ class BaseModelOptionTests(unittest.TestCase):
         configs = [path for path in (Path(__file__).parents[1] / "configs").glob("*.yaml") if path.name != "curricula.yaml"]
         self.assertTrue(configs)
         for path in configs:
-            if path.name.startswith(("olmocr", "lighton")):
+            if path.name.startswith(("olmocr", "lighton", "qwen38")):
                 continue
             config = load_config(path)
             self.assertFalse({"image_longest_edge", "prompt", "prompt_first", "target_logits_only"} & set(config), path.name)
