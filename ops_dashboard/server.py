@@ -3,6 +3,7 @@ import concurrent.futures
 import copy
 import csv
 import json
+import os
 import shlex
 import subprocess
 import threading
@@ -11,12 +12,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from telemetry import snapshot
 from live_state import enrich
+import badgerbrain
 import settings
 import history
 
 ROOT = Path(__file__).resolve().parent
 CONFIG = settings.load()
-state = {'gpus': [], 'refreshing': True, 'kaggle': None, 'kaggle_checked': 0, 'history_checked': 0}
+state = {'gpus': [], 'badgerbrain': None, 'refreshing': True, 'kaggle': None, 'kaggle_checked': 0, 'history_checked': 0}
 KAGGLE_EVERY = 600  # seconds between Kaggle and run-history checks; Kaggle's API is rate limited
 lock = threading.Lock()
 trigger = threading.Event()
@@ -72,6 +74,19 @@ def refresh():
             state['refreshing'] = False
         trigger.wait(120)
         trigger.clear()
+
+
+def refresh_badgerbrain():
+    """Gateway status every 30 seconds. The key stays in this process and never reaches the page."""
+    key = os.environ.get('OPENAI_API_KEY')
+    while True:
+        try:
+            item = badgerbrain.status(key, ROOT.parent / CONFIG.get('local_runs', 'runs'))
+        except Exception as error:  # a bad run folder must not end the checks
+            item = {'reachable': False, 'runs': [], 'models': [], 'error': type(error).__name__, 'checked': time.time()}
+        with lock:
+            state['badgerbrain'] = item
+        time.sleep(30)
 
 
 def submission_status(gpus, kaggle=None):
@@ -182,6 +197,7 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == '__main__':
     threading.Thread(target=refresh, daemon=True).start()
+    threading.Thread(target=refresh_badgerbrain, daemon=True).start()
     port = int(CONFIG.get('port', 8766))
     print(f'Dashboard: http://127.0.0.1:{port}', flush=True)
     ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
