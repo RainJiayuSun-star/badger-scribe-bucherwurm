@@ -15,6 +15,9 @@ def lora_targets(model, config: dict[str, Any]) -> list[str]:
     import torch
 
     language_suffixes = {"q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"}
+    if config.get("model_family") == "qwen3_5":
+        # 48 of Qwen3.8-27B's 64 layers use linear attention, which has none of the suffixes above.
+        language_suffixes |= {"in_proj_qkv", "in_proj_z", "out_proj"}
     targets = []
     for name, module in model.named_modules():
         if not isinstance(module, torch.nn.Linear):
