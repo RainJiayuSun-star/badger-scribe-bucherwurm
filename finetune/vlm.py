@@ -69,7 +69,8 @@ def load_model_and_processor(config: dict[str, Any], local_rank: int):
         **extra,
     )
     model.config.use_cache = False
-    if mode == "4bit":
+    # prepare_model_for_kbit_training casts unquantized weights to fp32: about 10 GiB more on Qwen3.8-27B.
+    if mode == "4bit" and config.get("model_family") != "qwen3_5":
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
     else:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})

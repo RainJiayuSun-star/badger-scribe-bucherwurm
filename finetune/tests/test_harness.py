@@ -240,6 +240,18 @@ class Qwen38Tests(unittest.TestCase):
         self.assertTrue(any("linear_attn.in_proj_qkv.lora_A" in name for name in names))
         self.assertTrue(all("lora_" in name for name in names))
 
+    def test_4bit_load_keeps_unquantized_weights_in_bf16(self):
+        from unittest import mock
+
+        from finetune import vlm
+
+        for family, calls in (("qwen3_5", 0), ("qwen", 1)):
+            with mock.patch("transformers.AutoProcessor.from_pretrained"), mock.patch("transformers.BitsAndBytesConfig"), \
+                    mock.patch("transformers.AutoModelForImageTextToText.from_pretrained", return_value=self.tiny_model()), \
+                    mock.patch("peft.prepare_model_for_kbit_training", side_effect=lambda model, **_: model) as prepare:
+                vlm.load_model_and_processor({"model_id": "m", "quantization": "4bit", "model_family": family}, 0)
+            self.assertEqual(prepare.call_count, calls, family)
+
     def test_thinking_is_off_for_this_family_and_untouched_for_others(self):
         from finetune.vlm import _chat_text
 
