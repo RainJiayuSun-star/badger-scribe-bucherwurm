@@ -1,0 +1,421 @@
+# Fine-tuning experiment log
+
+Running record of how the Badger Scribe models were fine-tuned, for the draft writeup (due 2026-11-18, noon) and final writeup (due 2026-12-02).
+
+**Keeping it current:** every fine-tuning change or run gets recorded here when it happens: add a row to section 7, add scores to section 8, add run IDs to section 9, and change sections 4 and 5 if the method changed. Each section states whether it is measured, inferred or still open.
+
+Last updated: 2026-11-12.
+
+## 1. Where things stand
+
+- **First Kaggle score: 0.143** (run `submission-01`, submitted by Ian on 11-03). Kaggle shows the public subset of test pages until close, and English test pages are scored against provisional machine labels. **Every other score below comes from training documents held out of fine-tuning**, not from the test set.
+- **No model has been trained on all the data yet.** The largest runs used 284 of 295 German pages and 318 of 324 English pages.
+- **The test-set prediction script (`finetune/predict.py`) works on a GPU with saved adapters, shown by two fold checks (section 7).** It isn't committed yet (branch `predict-script`). The first test-set run, `submission-01`, finished all 208 pages on 11-03.
+- **Code:** on `main` since 2026-11-02 (PR #4, squash commit `ab937e3`), including the review fixes (section 7). `ian-dev` is synced with it.
+- **All scores below except survey_011 predate those fixes.** They changed augmentation, so future runs are not identical to the earlier ones reported here (section 11).
+
+| Category | Zero-shot CER | Fine-tuned CER | Evidence |
+|---|---|---|---|
+| German letters (`kade_letters`) | 0.215 | **0.087** | Strong: all 4 letters held out once, 295 pages, all human labels |
+| Survey notes (`survey_notes`) | 0.292 (0.366 on survey_003, 0.284 on survey_011) | **0.049** on survey_003, **0.109** on survey_011; about 0.077 page-weighted | Weak: 2 of 9 notebooks, 97 of 101 pages scored against machine drafts; the two runs used different augmentation |
+| Account books (`dominy_accounts`) | 0.460 (0.380 on group 5) | **0.301** on group 5 | Weak: 6 pages, from an easier-than-average group |
+
+Rough macro estimate: 0.322 zero-shot, about 0.155 fine-tuned (0.146 before survey_011 was added). The fine-tuned figure mixes one strong number with two weak ones, so treat it as an estimate. Account books make up about 0.10 of the 0.155. The public leaderboard's 0.143 is close to it, but the two cover different pages and we have no per-category split of the leaderboard score, so this doesn't confirm any one category's number.
+
+## 2. Data
+
+Competition release, `badger-scribe-data/`, downloaded 2026-09-17. The lesson materials updated 2026-11-02 list the same page counts, but that does not prove labels are unchanged. Check Kaggle before the final models.
+
+| Category | Train pages | Human labels | Machine drafts (`silver_claude`) | Test pages |
+|---|---|---|---|---|
+| German letters | 295 | 295 | 0 | 141 |
+| Survey notes | 288 | 16 | 272 | 31 |
+| Account books | 36 | 2 | 34 | 36 |
+| **Total** | **619** | **313** | **306** | **208** |
+
+- All 9 Kade documents (train 007, 103, 112, 128; test 009, 037, 042, 058, 138) are Anna Seifert's letters to her son Lester, 1932-1942, per `metadata.csv`. **German is one writer**, so training on the train letters is training on the test writer's hand, which the rules allow. The hand, pen and paper still change over the decade.
+- Scoring macro-averages the 3 categories, so each counts for one third regardless of page count.
+- **External data: none.** The WIGLOSR survey database was reviewed and not used.
+
+## 3. Model and environment
+
+| Item | Value |
+|---|---|
+| Base model | `stanford-oval/churro-3B` (open weights, built on Qwen2.5-VL-3B) |
+| Method | LoRA fine-tuning; base weights frozen in bf16 |
+| Software | Python 3.13.16, torch 2.14.0+cu126, transformers 5.17.0, accelerate 1.15.0, peft 0.21.2, qwen-vl-utils 0.0.14 |
+| Hardware | EFabric: 1 A100-SXM4-40GB (2026-10-17 runs) or 1 RTX A5000 24 GB (2026-10-18 onward); always one GPU per run |
+| Peak GPU memory, training | 11.8 GB (German); about 15.8 GB (English) |
+| Peak GPU memory, inference on the full test set | 8.87 GiB reserved on an A5000 (`submission-01`, measured). Reserved memory reads higher than the allocated figures above. Repeat for the final models |
+| Wall time, full test set | 37 min including 32 s of model loading (`submission-01`, measured). Seconds per page: German 8.5, account books 7.9, survey 22.8 |
+
+Other models were not fine-tuned. `qwen3vl-4b-bf16.yaml` exists but has not been trained.
+
+## 4. Training configuration
+
+Config: `finetune/configs/churro-3b-bf16.yaml`. The English runs add `human_repeats: 3` and the `dominy-survey` curriculum.
+
+| Setting | Value |
+|---|---|
+| LoRA | Rank 16, alpha 32, dropout 0.05 |
+| LoRA targets | Language model `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`, plus the vision-to-language merger (`adapter_policy: language_projector`). The rest of the vision tower is frozen |
+| Trainable size | Adapter file 127 MB (about 30 million parameters; inferred from size and the lesson's arithmetic, not read from a log) |
+| Optimizer | AdamW, learning rate 1e-4 for language and merger; the `vision_learning_rate` of 2e-5 applies only to other vision adapters, which this policy doesn't create |
+| Schedule | Cosine with 5% warmup |
+| Batch | 1 page per step, 8 accumulated (effective batch 8) |
+| Gradient clipping | Max norm 1.0 |
+| Epochs | 3 |
+| Precision | bf16, no quantization, gradient checkpointing on |
+| Seed | 20261003 |
+| Image budget | 1,003,520 pixels (1,280 image tokens, about 1.0 MP); survey notes 2,007,040 (2,560 tokens, about 2.0 MP) |
+| Max sequence length | 8,192 tokens |
+| Prompt | "Transcribe every visible text character exactly as written. Preserve spelling, case, punctuation, and reading order. Output only the transcription." |
+| Catalog metadata in prompt | Not used |
+
+**Labels (`finetune/prep.py`):**
+- Envelope "Postmark" lines are removed from training targets on 79 pages. It is always the last line of the key. The line wasn't visible on the 3 images spot-checked (kade_103_p164, kade_007_p079, kade_103_p107); the other 76 haven't been checked by eye. Scoring always uses the original key.
+- Target tokens containing `#` (297 `#` characters in the data) get no loss, so the model never learns to emit `#`.
+- Loss covers the transcription only, not the prompt or image tokens.
+- Survey spreads train and predict as whole two-page images, with no splitting of images or keys. Text-splitting code that was never used in training was deleted on 2026-11-02; it could split 143 of 288 keys at the printed page number and remains in git history (`b2c8917`).
+
+**Augmentation (`finetune/augmentation/default.yaml`), applied to 80% of pages:**
+
+| Transform | Chance | Range |
+|---|---|---|
+| Rotation | 40% | ±1.5° |
+| Contrast | 50% | ±12% |
+| Brightness | 50% | ±10% |
+| Gaussian blur | 20% | radius 0.1-0.7 |
+| JPEG recompression | 25% | quality 72-92 |
+| Noise | 18% | ±5 on about 3.5% of pixels, same value on all color channels. **Until 2026-11-02 this step also turned the whole page grayscale, including in every run reported below** |
+
+Each repeat of a human page now gets its own augmentation (section 11).
+
+**Curricula and pages per run:**
+
+| Run | Trained on | Unique pages | Pages per epoch | Optimizer steps per epoch |
+|---|---|---|---|---|
+| Hold out kade_103 | German only | 170 | 170 | 22, 22, 20 |
+| Hold out kade_007 | German only | 218 | 218 | 28, 28, 26 |
+| Hold out kade_128 | German only | 213 | 213 | 27, 27, 26 |
+| Hold out kade_112 | German only | 284 | 284 | 36, 36, 35 |
+| Hold out survey_003 | Survey + accounts, human pages ×3 | 270 | about 302 | 38 each |
+| Hold out dominy_group5 | Survey + accounts, human pages ×3 | 318 | about 350 | 44 each |
+| Hold out survey_011 | Survey + accounts, human pages ×3 | 277 | about 309 | 39, 39, 38 |
+
+German and English have never been trained together.
+
+## 5. Decoding
+
+Greedy decoding, at most 4,096 new tokens. **Probably with a repetition penalty of 1.05 that we never chose.** `stanford-oval/churro-3B`'s `generation_config.json` on the Hub sets `repetition_penalty: 1.05`, and `finetune/vlm.py` overrides only `do_sample`. Measured on 2026-11-04 with a tiny GPT-2 on the pinned transformers 5.17.0: a call like ours applies a penalty set in `generation_config`, and passing `repetition_penalty=1.0` turns it off. Inferred for our runs: every reported score, including public Kaggle 0.143, includes it. Open: print `model.generation_config.repetition_penalty` on the real model and measure decoding with 1.0.
+
+**Loop guard (`finetune/loopguard.py`, on by default).** Stops generation at a repetition loop and keeps the first copy. A loop is a block of 1-6 lines repeated at least 4 times, or a run of words (at least 20 characters, at most 120 words) repeated at least 3 times, ignoring line breaks. None of the 619 answer keys is changed by it. A fuzzier detector was rejected because it wrongly cut the real page dominy_018_p002.
+
+**Sampled retry (optional, off by default).** Pages that looped or came out under 40 characters are decoded again at temperatures 0.3, 0.6, then 0.9, seeded per page. The first result that neither loops nor comes out nearly empty is used. It stays off because fine-tuned models don't loop.
+
+## 6. Evaluation protocol
+
+- **Metric:** the official `metric.py`. Page CER capped at 1.0, averaged within each category, then across categories. `#` in a reference matches anything.
+- **Leave-one-document-out folds (`finetune/folds.py`):** 19 folds. One per German letter (4), one per survey notebook (9), and 6 groups of account books with 6 pages each. Test pages come from documents not in `train.csv`, so random page splits would flatter the score. Each row of results comes from a model that never trained on that document.
+- **Scoring:** all held-out pages after every epoch. `best_adapter` is the epoch with the lowest CER on those same pages. From 2026-11-02 each evaluation also records `val_human_macro_cer` and `val_human_pages`; the reported runs don't have them as logged metrics.
+- **Limitation:** choosing the best epoch on the fold makes each score slightly optimistic. On English folds this selection rests mostly on machine-drafted labels (section 11).
+- **Comparison with the organizers' lesson:** its German result (0.267 to 0.065 on 15 pages) uses a random-page holdout, so pages of one letter appear on both sides. The lesson itself warns this flatters the score, so it isn't comparable with our 0.087.
+
+## 7. Timeline of steps
+
+| Date (UTC) | Step | Why | Result | Commit or run |
+|---|---|---|---|---|
+| 11-12 | Prepared the account-label human-review queue | Correcting unreliable account drafts is the highest-yield remaining fine-tuning input | Measured: reused the completed zero-shot Churro, olmOCR and Yale LightOn screens, so no GPU rental was needed. Verified all 34 targets are `silver_claude` account training pages and none is in `test.csv`; exported 102 immutable per-model drafts with model revisions, source paths and SHA-256 provenance. `review_queue.csv` places all 18 pages under 300 normalized characters first and ranks each block by mean pairwise normalized edit distance. No correction file was created and no label was marked human | `runs/pm/step7/rank_disagreement.py`, `screen-{churro,olmocr2,yale-lighton3}-zs` |
+| 11-11 | Pruned the experiment backlog after the LightOn and six-fold loss readouts | The planned-experiments table still listed completed work and low-value arms as pending | Kept only work with a plausible path to a material gain: better account labels, an image-plus-draft correction screen, a Chandra 2 screen after license clearance, survey spread handling, and final release work. Removed metadata prompting, combined-model training, no-augmentation, more small loss tweaks, and completed fold/final-model work. Measured basis: 5% truncation improved six-fold draft-label CER about 0.3153 to 0.2992 but tied the public score; smoothing reached about 0.3131; LightOn failed its gate; metadata, no-augmentation, voting, higher resolution, and combined account-only training already lost | Documentation only |
+| 11-11 | LightOn folds resumed across both renewed GPUs | The 5-step smoke passed and GPU 2 was idle | Measured: `smoke-lighton-yale` completed 5/5 steps on the largest account pages at 11.55 GiB peak; 96 finetune tests passed earlier. GPU 1 runs groups 1 and 3, then the epoch-3 gate/all-data/publish path; GPU 2 runs groups 2 and 5. Group 1 reached epoch 1 CER 0.5012 and step 45/133 before the split. `submission-08` is created only inside the publish step after the gate and all-data adapter succeed | `e0956a0`, PR #13 merged as `e1665cc`, `smoke-lighton-yale`, `ft33-lighton-yale-dominy_group{1,3,2,5}` |
+| 11-11 | Submission naming convention corrected | Gated or failed attempts never produced a submission artifact and should not consume submission numbers | Going forward, experiment-specific `candidate-*` IDs cover gated prediction attempts. A `submission-N` ID is assigned only to a prediction run that can produce a complete CSV; the next available number after successful `submission-07` is `submission-08`. Retrospectively renamed the failed placeholders: 08 → `candidate-accounts-smooth`, 10 → `candidate-accounts-trunc02`, 11 → `candidate-german-e4`; the cancelled 09 placeholder → `candidate-accounts-trunc10`. The pending LightOn artifact was renumbered from 12 to `submission-08` | queue metadata and history corrected |
+| 11-10 | Yale LightOnOCR-3-4B LoRA harness and account-fold comparison queued | Yale's base had the best account-book zero-shot CER (0.3188), but had not been fine-tuned in this harness | Added a pinned Yale config and a LightOn-specific processor path that disables thinking and preserves the model's own 2,048-visual-token image budget; Qwen remains the default path. Measured: all 96 finetune tests pass on EFabric. Queued on GPU 1 after the in-progress olmOCR group-4 run: 5-step largest-account smoke, groups 1/3/2/5, gate at epoch 3 against 0.2587 (needs mean <=0.2537), then all-data and account-only `submission-08` if it passes | `e0956a0`, `smoke-lighton-yale`, `ft33-lighton-yale-dominy_group{1,3,2,5}`, `ft34-all-lighton-yale`, `submission-08` |
+| 10-14 | Stopped tracking label files; added local rebuild script | Label text shouldn't live in tracked files | Rebuilt locally from `train.csv` | `0c125be`, `fe8bbe1`, `82b1d32` |
+| 10-14 | Label cleaning | Postmark lines and `#` would teach the wrong thing | 79 postmark pages, 297 `#` found | `b2c8917` |
+| 10-14 | Leave-one-document-out folds | Test documents aren't in train | 19 folds | `b1ac70c` |
+| 10-16 | Harness: bf16, per-category image size, target masking, Qwen3-VL support | Fit the model and match the data | Runs on one GPU | `b094959` |
+| 10-16 | Fixed model left in eval mode during the first epoch | Gradient checkpointing and LoRA dropout were inactive | Peak memory 30.5 GB to 11.9 GB | `6e99ba8` |
+| 10-16 | `--eval-only` and per-page score files | Baseline on identical folds | Zero-shot per fold possible | `f99daee` |
+| 10-17 | Zero-shot German | Baseline | 0.274; 37 of 295 pages looped | `churro-bf16-zeroshot-kade` |
+| 10-17 | Loop guard | A looping page scores 1.0 regardless of the text before the loop | German 0.274 to 0.215; run time about 90 to 33 min | `115dc14`, `churro-bf16-zeroshot-kade-guard` |
+| 10-17 | First German fine-tune, hold out kade_103 | Does fine-tuning help on an unseen letter? | 0.214 to 0.087, 0 loops | `churro-bf16-ft-kade103` |
+| 10-17 | Zero-shot English | Baseline | Survey 0.292, accounts 0.460 | `churro-bf16-zeroshot-english` |
+| 10-17 | Sampled retry on 37 German pages | Rescue looping pages | German 0.215 to 0.196; left off since fine-tuned models don't loop | `f94df97`, `churro-bf16-retry-kade` |
+| 10-17 | `human_repeats: 3` for English | Only 18 English pages have human labels | Added | `9130a1f` |
+| 10-17 | Other German folds and English fine-tunes | Confirm German; test English | Scored, but disk quota killed runs at checkpoint saves (section 10) | `churro-bf16-ft-*` |
+| 10-17 | Moved checkpoints to `/tmp`, reran | Avoid the home quota | Workspace restarted about 22 min in (section 10) | `ft2-*` |
+| 10-18 | Reran survey_003 on an A5000 | Finish the English fold | 0.049, then 0.056; workspace restarted during epoch 3 | `ft3-english-survey_003` |
+| 10-18 | Small FIFO checkpoints, diagnostics | Stop filling disks; show where runs die | 0.34 GB checkpoints in home, tested with a resume | `8e39104`, `ckpt-test` |
+| 10-18 | Preflight checks, status command | Stop bad runs before they start | Tested live | `4d702fb` |
+| 11-02 | Compared with organizers' LoRA lesson | Facilitator recommended it | Same core method; settings to test in section 13 | No run |
+| 11-02 | Full code review of PR #4 | Check before merging | 55 findings; those affecting method are in section 11 | `runs/reviews/pr4-findings.md` |
+| 11-02 | Fixed review items 1-23 | Protect runs and correct training bugs | Grayscale noise, identical repeats and overwrite risk fixed; human-only CER added; 92 tests pass on CPU. **No GPU run yet with these changes** | `e559b99`, merged in `ab937e3` |
+| 11-02 | Merged PR #4 to `main` | Shared starting point for the team | Rain agreed directly; no approval recorded on GitHub. Fresh clone of `main` passes all tests | `ab937e3` |
+| 11-03 | Prediction script, `finetune/predict.py` | Needed for a first Kaggle submission | Measured on CPU only: reloading saved adapters from disk and switching between them matched each adapter's in-memory output exactly, using the real `load_model_and_processor` on a tiny random Qwen2.5-VL with peft 0.21.2. Also ran over the real `test.csv` (208 pages) and the `kade_112` fold with decoding faked and no image opened. **Open: no GPU run, no Churro-3B run, no real page decoded** | `fe0eb9a`, branch `ian/predict-script` (committed 11-04, not merged) |
+| 11-03 | Ran all tests on an A5000 for the first time | Handoff GPU step 4 | 11 failed there and passed on CPU, 3 of them already on `main`: the tests patch `is_available` to False, which breaks the GPU memory counters once CUDA is initialized. Test problem only; fixed with one mock per file. 106 tests now pass on the A5000 | `b2d2974`, `fe0eb9a`, branch `ian/predict-script` (committed 11-04, not merged) |
+| 11-03 | First GPU run of the 11-02 code: 4 steps on kade_112, then resume | Handoff GPU step 4 | First leg finished: checkpoint 0.338 GiB in 0.7 s, peak 11.9 GB. CER 0.2171 after 4 steps shows only that scoring runs, not model quality. Resume loaded checkpoint-4 at step 4 and finished at step 8. That leg scored worse (0.2209), and the best score stayed at 0.2171 as intended | `smoke-1103`, A5000 |
+| 11-03 | Fold checks: reloaded saved adapters from disk and scored held-out training pages | Prove adapters load, since a failed load gives the zero-shot score with no error | German `kade_112` 0.1348 (run logged 0.1365, zero-shot 0.2466). English `dominy_group5` 0.3014 (run logged 0.3011, zero-shot 0.3795). Measured: 7 of 11 and 5 of 6 pages are identical to the training run's saved text, the rest 98-99.5% similar. Inferred, not confirmed: the differences come from A100 versus A5000 arithmetic. Peak 7.8 GiB reserved at 1 MP. Adapters from before the augmentation fixes | `check-german-1103`, `check-english-1103` |
+| 11-03 | First test-set prediction | Prove the path to a Kaggle submission | All 208 pages once each in `sample_submission.csv` order, none empty, 8 under 40 characters (not examined, since test output stays unread). Loop cuts: 2 account books, 1 German, 0 survey; fine-tuned fold runs had 0, so test account books may be harder for this adapter. **Public leaderboard 0.143, as reported by Ian.** Adapters predate the augmentation fixes and each trained on a fold subset. The English adapter has no survey score from this run's fold, so survey on the test set is unknown. `summary.json` records `ab937e3-dirty`: `predict.py` was untracked and one test file edited, so this run doesn't meet the pinned-code requirement for a final submission | `submission-01` |
+| 11-03 | English fold on survey_011 | First scoring of a second survey notebook, and first full-length run of the 11-02 code | 0.284 to 0.109 at epoch 3, 0 loops, no restart in 1 h 42 min. On the 2 human-labeled pages alone, 0.0534; the other 45 are machine drafts. survey_003's 0.049 now looks optimistic. This uses the fixed augmentation on a different fold, so it doesn't measure the augmentation fix | `ft4-english-survey_011` |
+| 11-03 | Copied the 208 test images to EFabric | They had never been copied there; only the 619 train images were | Sent directly from the Mac over SSH, all hashes match. Train and test CSVs and `metric.py` also match the Mac | No run |
+| 11-04 | Rules audit against `ChallengeDescription.md` and `WRITEUP_TEMPLATE.md` | Ian asked | No hard-line breach found on this Mac: 0 test images read in the 13 retained transcripts (back to 09-30), 0 catalog requests, 0 test pages in the 19 fold files, `label_source` dropped at inference, no key patterns in git history. **Open before a final entry:** no LICENSE, `WRITEUP.md`, tag, published adapters or predictions CSV in the repo, and no Kurrent Transcription Group credit. Rules tab read 11-04. Churro-3B is confirmed as allowed for a final entry, as reported by Ian on 11-04 and not independently verified; source to be recorded. **Open: EFabric and teammates' machines are still not covered by this audit** | No run |
+| 11-04 | Plan step 1: error split on fine-tuned held-out predictions, no GPU | Do short account-book pages still fail after fine-tuning? That decides whether the plan reorders | Measured, held-out: group 5's two short pages score 0.917 (48 characters) and 0.556 (63 characters, zero-shot 0.540) and hold 81.5% of its 0.3011; the other 4 pages average 0.0835. Structural error 0.171, 56.9% of the fold (71.9% by the scope split). Inferred: the plan's rule (short pages off the cap and structural well under half) isn't met, so short-page work stays and plan order is unchanged. Weak: six pages, structural bootstrap 0.005 to 0.386, 42.9% if one page is dropped. 0 loop cuts and length ratios of 1.02 and 1.05 mean this split can't separate a lost line from a badly misread short line, and both short pages are `silver_claude`, so length and label source can't be separated in this fold. Survey order loss, held-out: survey_011 0.0109 to 0.0176 by measure, 0.0003 to 0.0065 without one page of 47; survey_003 0.0041 to 0.0086. No splitter built. German letter misreads, held-out: 0.0526 kade_007, 0.0427 kade_128, 0.0535 kade_112 | No run; `runs/analysis/step1/summary.md` |
+| 11-04 | Committed the English config | Needed for clean-commit runs | `finetune/configs/churro-3b-bf16-english.yaml`, same content as `runs/english.yaml`, no absolute paths. Tests pass on the Mac | `b6d7d47`, branch `ian/english-config`, local only |
+| 11-04 | Plan step 5 started: all six account-book folds | First 36-page fine-tuned number | Running on GPU B from a clean commit; results to follow | `ft5-english-dominy_group{1,6,4,2,3,5}` |
+| 11-04 | Plan step 2: printed the penalty, decoded with it off | The Hub config sets 1.05 and we never chose it | Measured on the real model: `repetition_penalty` 1.05, on the peft model and the base. Held-out, A5000, 1.0 against the current value: kade_103 0.0873 to 0.0898, gain -0.0026 (95% -0.0090 to 0.0013), 2 new loop cuts; survey_011 0.1090 to 0.1139, gain -0.0050 (-0.0087 to -0.0016); group 5 0.3014 to 0.2975, gain +0.0040 (-0.0008 to 0.0097). The paired decode rule fails: intervals include zero on two of three folds and new loop cuts appeared. Keep 1.05, set explicitly in the German config (`55bbd88`, no run has used that commit); the English config needs the same line at merge. Limit: only kade_103's baseline was re-decoded in this session; survey_011's is the training-loop decode and group 5's an earlier predict run | `dec-base-kade103`, `dec-rp10-*`, `5a79080`, `55bbd88`, branch `ian/repetition-penalty`, local only |
+| 11-04 | Plan step 3: higher image budgets on saved adapters | Dense pages may lack image tokens | Held-out, A5000: kade_103 at 2 MP 0.0873 to 0.0934, gain -0.0061 (95% -0.0158 to 0.0001); survey_011 at 4 MP 0.1090 to 0.1353, gain -0.0264 (-0.0632 to 0.0097); group 5 at 2 MP 0.3014 to 0.2963, gain +0.0052 (-0.0449 to 0.0565). No paired gain, so 4 MP on group 5 was not run, and 0.005 is reached on one fold only, so no retrain. 4 MP peaked at 9.19 GiB. Account part reruns on six adapters after step 5 | `dec-2mp-*`, `dec-4mp-survey011`, `5a79080` |
+| 11-05 | Plan step 4: second test-set prediction, one run | Only the English adapter changes, from a clean commit | 208 pages in order, 0 empty. Loop cuts: accounts 1, German 1, survey 0. 38.6 min, 8.87 GiB reserved. Measured: German rows byte-identical to `submission-01` on 141 of 141, so same-GPU decoding repeated exactly for that adapter. Accounts 5 of 36 and survey 2 of 31 identical. Text not read. Public score reported by Ian on 11-05: 0.150 versus 0.143 for `submission-01`, a 0.007 regression, beyond the 0.005 tie threshold. Reject this English adapter for the final pipeline | `submission-02`, `b6d7d47`, clean |
+| 11-05 | `category_repeats` training option | Plan step 8's repeats arm | Off by default; test added; both suites pass on the Mac | `ian/account-repeats`, local only |
+| 11-05 | Plan step 5: all six account-book folds on the 11-02 code | First 36-page fine-tuned number | Measured, held-out, A5000, best epoch per fold (chosen on the same pages, so slightly optimistic): groups 1 to 6 score 0.3553, 0.2571, 0.2602, 0.4013, 0.3381, 0.3470; **36 pages 0.3265**, against Churro zero-shot 0.4628 on the same pages and GPU. 2 human-labeled pages 0.0867. 0 pages at or above 0.99. 2 loop cuts at the best epochs (dominy_018_p004, dominy_008_p004). Pages of at most 100 characters: 10 pages, mean 0.577, 49.1% of category CER, 2 at or above 0.9. Group 5 reran at 0.3381 against 0.3011 before the augmentation fix, which six pages can't separate from noise. Inferred: the step 1 rule still doesn't fire on 36 pages, so plan order stands. 75 to 76 min per fold | `ft5-english-dominy_group{1..6}`, `b6d7d47` |
+| 11-05 | Plan step 3, account part rerun at 2 MP on the six new adapters | The plan's rerun once six adapters exist | Held-out, 36 pages: 0.3265 to 0.3247, gain +0.0018, 95% -0.0327 to 0.0350 by document. Per fold gains -0.0900, -0.0133, +0.0446, +0.0314, +0.0392, -0.0012; group 1 is worse by more than 0.005, and loop cuts rose from 2 to 6. The paired decode rule fails, so 4 MP wasn't run and accounts stay at 1 MP. Three folds reach a 0.005 gain, the plan's precondition for retraining at a higher budget, but with the rule failing no retrain was started (PM's call, open to Ian) | `dec-2mp-dominy_group{1..6}`, `b6d7d47` |
+| 11-05 | Plan step 8, repeats arm: account pages 3 times per epoch | Account books get one third of the score from 36 pages | Held-out, 36 pages, current labels: 0.3265 to 0.3219, gain +0.0046, 95% -0.0222 to 0.0302 by document, 17 pages better and 17 worse. Misses the 36-page rule (at least 0.03 with an interval excluding zero). The rule is meant to be applied on corrected labels, which wait on people (step 7); rescoring both arms against corrections needs no GPU. The corrected-labels arm is blocked on step 7 | `ft8-repeats-dominy_group{1..6}`, `f45560a` |
+| 11-05 | Plan step 9 seeds | Voting members and a better noise estimate | Measured, held-out, A5000, epoch 3: seed 20261004 on kade_103 0.0866 (epochs 0.1066, 0.0873, 0.0866; the original A100 run, before the augmentation fix, gave 0.0868); on survey_011 0.0962 (0.1259, 0.1095, 0.0962) against 0.1090 for the original seed with the same config and GPU. That one pair differs by 0.0128, larger than the 0.005 noise figure, so treat survey comparisons with more caution. Seed 20261005 runs were cut by the workspace stop: kade_103 scored epoch 1 (0.1028); survey_011 was in its first evaluation. Both to resume. Voting not yet tested | `ft9-seed{2,3}-kade103`, `ft9-seed{2,3}-survey011`, `b6d7d47` |
+| 11-05 | Lost GPU time | | Two worker sessions (step 6 base screen, step 9 voting code) died on API errors after about 11 hours, so GPU A sat idle from 02:18 to 17:15 UTC and GPU B from 13:14 to 17:15. Step 6 has only Churro's zero-shot (0.4628 accounts, 0.2806 survey_011, A5000); no other base was decoded | No run |
+| 11-05 | New workspaces; GPU queues | Keep the GPUs busy without an agent in the loop | Two new A5000 workspaces from about 21:31 and 21:47 UTC. Each GPU now runs a queue script in tmux that works through several runs back to back, resumes after a kill, logs commit and exit code, and won't start a run that can't reach a checkpoint before the 24-hour limit. Queues started at 22:02 | No run |
+| 11-05 | Plan step 5: loop retry on the six account adapters | Two pages were loop-cut at best epochs | Measured, held-out, A5000, each ft5 adapter decoded with and without `loop_retry_temperatures: [0.3, 0.6, 0.9]`, `retry_min_chars: 1`. Paired decode rule: no fold's interval excludes zero. Group 1 unchanged (its loop cut remains), group 3 gain -0.0021 (95% -0.0063 to 0), the other four identical. 36 pages 0.3265 to 0.3269, gain -0.0004 (-0.0011 to 0.0) by document. **Retry stays off.** The decodes without retry reproduce the ft5 training evaluations exactly (36 pages 0.3265), so the predict path and training evaluation agree on this GPU (measured) | `dec-noretry-dominy_group1` to `6`, `dec-retry-dominy_group1` to `6`, `b6d7d47` |
+| 11-05 | Plan step 9: medoid and per-character voting | Expected 0.005 to 0.023 macro | Measured, held-out, A5000 decodes, scored with the official page metric. Seeds (best epoch of each): kade_103 members 0.0873, 0.0866, 0.0868; medoid 0.0864, gain over the best member +0.0002 (95% -0.0008 to 0.0011); vote 0.0858, +0.0007 (-0.0002 to 0.0017). survey_011 members 0.1090, 0.0962, 0.0948; medoid 0.0945, +0.0003 (-0.0031 to 0.0037); vote 0.0935, +0.0013 (-0.0018 to 0.0044). Epoch medoids and votes (part A) on five runs: gains from -0.0131 to +0.0005, no interval excludes zero. **Misses the bar of 0.005 on each of two folds, so voting stops** (no test decode needed). Members differ by mean pairwise CER 0.0196 (kade) and 0.0426 (survey). The kade_103 seed-1 member was trained on an A100 before the augmentation fix and decoded on an A5000. Best member and best epoch are picked on the scored pages, so the bases are slightly optimistic | `ian/voting` `6100f9c`, local only |
+| 11-05 | Run-to-run noise from three seeds | Replaces the two-pair estimate | Measured, held-out, A5000: seed SD 0.0004 on kade_103 (three runs within 0.0007) and 0.0078 on survey_011 (range 0.0142; seeds 2 and 3 alone 0.0014 apart, the original seed is the outlier). Inferred: German retraining noise looks well below the plan's 0.0044 estimate, survey noise above it. Open: whether the original survey seed differed in something other than the seed (its config differs only in seed and checkout path) | `ft9-seed3-survey011` |
+| 11-05 | Plan step 6: base screen script | Screen olmOCR-2-7B, Yale's LightOnOCR-3-4B fine-tune and stock LightOnOCR-3-4B against Churro zero-shot | `finetune/screen_base.py` decodes the 83 pages of `screen-churro-zs` (36 account pages, survey_011) greedily with the loop guard, each model's card prompt and image rule, `enable_thinking=False`, and markup stripped before scoring with the repo's metric. Weights pinned by revision. Smoke-tested on CPU only. Bar: beat Churro (0.4628 accounts, 0.2806 survey_011, A5000) by more than 0.03 | `ian/base-screen` `f6a73ca`, local only; runs queued on GPU 2 |
+| 11-05 | Plan step 10 baselines | The kade_007 and kade_128 runs ran on an A100 and before the augmentation fix | Both are rerun on the A5000 at seed 20261004 from `b6d7d47`; kade_103's baseline is `ft9-seed2-kade103` (same seed, config, commit and GPU type). All step 10 and 11 arms use that seed and commit. Measured, held-out: kade_007 rerun 0.1023 (the A100 run gave 0.1004) | `ft10-base-kade007`, `ft10-base-kade128` |
+| 11-06 | Plan step 10: learning rate 2e-4 for 3 epochs, kade_103 | Peak learning rate times steps is 2.3 to 3.9 times below the organizers' lesson | Measured, held-out, A5000: 0.0762 (epochs 0.0884, 0.0773, 0.0762; 0 loop cuts) against `ft9-seed2-kade103` 0.0866 (0.1066, 0.0873, 0.0866). The two run configs differ only in learning rate (checked); same seed, commit and GPU type. Gain 0.0104, above the three-fold rule's one-fold bar of 0.009; seed SD on this fold is 0.0004 (measured, three seeds). So 2e-4 passes on German on this fold alone. kade_007 and kade_128 at 2e-4 still run and will be reported. Per the plan, 2e-4 goes to the six account folds next (36-page rule against `ft5`) and 2e-4 for 6 epochs is queued on German. Inferred: the best epoch is the last one, so this rate may not have peaked by epoch 3. 91 min | `ft10-lr2e4-kade103`, `b6d7d47` |
+| 11-06 | Step 10 baseline on kade_128 crashed after its first evaluation | | Exit code 120 at 23:59 UTC 11-05: "OSError: [Errno 9] Bad file descriptor" from the progress bar writing to the run's log, right after epoch 1 scored 0.0802 (held-out; the A100 run gave 0.0816), before any checkpoint. The log file got no writes after 23:45, when that evaluation began, and the traceback isn't in it. Inferred, not confirmed: the open handle to the log on the shared network home went bad during the evaluation. Rerun from scratch under a new ID with the same config; the failed run's folder is kept | `ft10-base-kade128` (failed), `ft10-base-kade128-r2` |
+| 11-06 | Plan step 6: three open-weight base screens | Test alternative OCR bases on the same held-out training pages and A5000 as Churro zero-shot | Measured: Churro accounts 0.4628 and survey 0.2806. olmOCR-2-7B accounts 0.3556, survey 0.1846; Yale LightOnOCR-3-4B accounts 0.3188, survey 0.3061; stock LightOnOCR-3-4B accounts 0.3365, survey 0.3116. Paired account gains by document: +0.1072 (95% 0.0114 to 0.2087), +0.1440 (0.0775 to 0.2078), +0.1263 (0.0112 to 0.2551), respectively. All pass the accounts bar; only olmOCR passes survey. Inferred decision: carry Yale and olmOCR, the plan's maximum two bases, to LoRA work after smoke and training-data source checks | `screen-olmocr2-zs`, `screen-yale-lighton3-zs`, `screen-lighton3-zs`, `f6a73ca` |
+| 11-06 | Step 10 learning-rate run on kade_007 crashed after all three evaluations | | Measured, held-out, A5000: epochs 0.1010, 0.0943, 0.0919, zero loop cuts, against baseline 0.1023. Exit 120 with `OSError: [Errno 9] Bad file descriptor` immediately after epoch 3. The epoch prediction files and metrics are complete, but `best_adapter` was last saved at epoch 2, so it does not represent the reported 0.0919. No finished event. The failed folder is kept | `ft10-lr2e4-kade007` (failed), `b6d7d47` |
+| 11-06 | Plan step 6 follow-up queued: olmOCR-2-7B LoRA on account-book groups 1, 2 and 3 | All three screened bases clear the accounts bar (olmOCR-2 zero-shot 0.3556 against Churro zero-shot 0.4628), so the plan calls for a LoRA on three account folds. Ian moved these ahead of step 11 | Queued at 10:41 UTC, not yet run. Same English settings as ft5 (lr 1e-4, 3 epochs, seed 20261003, human x3) on the olmOCR base, config `olmocr2-7b-bf16-english.yaml`. Compare with ft5 groups 1 to 3 (0.3553, 0.2571, 0.2602, held-out). Smoke test peaked at 19.6 GiB; estimate about 1 h 40 min per fold (inferred) | `ft6-olmocr2-dominy_group{1,2,3}`, `77bd396` |
+| 11-11 | Account groups 4 and 5, olmOCR ft6 settings (`ft32`) vs truncation 0.05 (`ft21`); LightOnOCR queued by Codex | Group 5 has the only expert account pages (2) | Measured, held-out, A5000, epoch 3. Group 5: ft6 settings 0.2527 (expert pages 0.0650), truncation 0.2212 (expert 0.0418); at epoch 2 the expert pages went the other way (0.0341 vs 0.0418). Group 4: 0.4725 vs 0.4361. Over all five groups truncation is ahead on four and level on one: mean 0.2805 vs 0.3003. Inferred: truncation 0.05 is probably slightly better on expert labels too, but 2 pages is too few to be sure; it supports submission-07 over 06 as a final pick, both 0.124 public. Codex added LightOnOCR support (`e0956a0`, clone run-k); `smoke-lighton-yale` rc 0 at 00:36 UTC; `ft33-lighton-yale-*`, `ft34`, `submission-08` skipped by the cutoff guard, so the renewal should rent new workspaces after 01:17 UTC to run them | `ft32-*`, `ft21-*-group{4,5}`, `smoke-lighton-yale`, `ft33-*` |
+| 11-10 | Truncation 0.02, German 4 epochs and German no-augmentation read out | | Measured, held-out, A5000, `22b6918`. Truncation 0.02 (`ft26`) epoch 3, groups 1, 3, 2: 0.2946, 0.2134, 0.2559, mean 0.2546, worse than 0.05 (0.2483) and only 0.004 better than ft6; gate failed, no `ft28`/`candidate-accounts-trunc02`. German 4 epochs (`ft29`) at epoch 4, kade_103, 007, 128: 0.0602, 0.0783, 0.0552, mean 0.0646 against ft15 0.0665, gain 0.0019, gate failed (`ft31` exit 1, `candidate-german-e4` not built); per fold -0.0036, -0.0013, -0.0008, all in the same direction but small. German no augmentation (`ft30`) epoch 3: kade_103 0.0635 (ft15 0.0638), kade_007 0.0785 (0.0796); kade_128 0.0650 (0.0560), mean 0.0690 against 0.0665, so augmentation helps (mostly on kade_128) and stays on. Inferred: German settings are now inside the 0.005 noise band; truncation strength 0.05 stays best of the three. No new submission for 11-10's evening upload | `ft26-*`, `ft29-*`, `ft30-*` |
+| 11-10 | Next German steps queued; truncation 0.10 stopped | submission-07 showed account-book fold gains (draft labels) do not carry to the public score, while German folds (all expert labels) have matched it twice; truncation 0.10 lost on group 1 (epoch 3 0.2894 against 0.05's 0.2777, epoch 1 0.4029) | Measured: `ft25` group 1 epochs 0.4029, 0.2998, 0.2894. Stopped `ft25-olmocr-trunc10-dominy_group3` at 12:39 UTC (exit 143) and commented out its group 2, `ft27`, `candidate-accounts-trunc10`. GPU 2 from 12:39: `ft29-vis-lr2e4-e4-kade_{103,007,128}` (ft15 settings, 4 epochs, seed 20261004), then `ft31-all-kade-vis-lr2e4-e4` and `candidate-german-e4` (submission-06 with only the German adapter swapped) if the epoch-4 mean beats ft15 0.0665 by 0.005. GPU 1 after `ft26`: `ft30-vis-lr2e4-noaug-kade_{103,007,128}` (ft15 settings, `augmentation_profile: none.yaml`), folds only | `ft25`, `ft29-*`, `ft30-*`, `ft31`, `candidate-german-e4` |
+| 11-10 | `submission-07` scored | Accounts adapter `ft23-all-olmocr-trunc` (truncation 0.05), German and survey as submission-06 | Complete 11:00 UTC, 208 pages, 1 loop cut, 18.37 GiB, `22b6918`; copied to the Mac by the alert script, hash matches. Measured by count only: 177 of 208 rows identical to submission-06 (31 of 36 account rows changed). Submitted 11-10, public score 0.124 reported by Ian: the same as submission-06, a tie. Inferred: if the public score is a macro mean over three categories, the public accounts CER moved by less than about 0.003, while the folds predicted about 0.010; the fold gain was mostly group 1's late-epoch drift and is measured against machine drafts, so it did not carry over. The truncation-strength arms (`ft25`, `ft26`) are judged by the same fold measure, so treat a pass there with the same caution | `submission-07`, `ft23-all-olmocr-trunc` |
+| 11-10 | Truncation strength queued | Ian: one upload on 11-10, use the remaining EFabric time (to 01:17 UTC 11-11) on model gains; truncation 0.05 was the only arm to pass | Queued 10:15 UTC, `22b6918`, ft6 settings otherwise, against ft21 0.2483 at epoch 3 with `gate.py`: GPU 2 `ft25-olmocr-trunc10-dominy_group{1,3,2}` (0.10, started 10:16), then `ft27-all-olmocr-trunc10` and `candidate-accounts-trunc10` if it passes; GPU 1, after `submission-07`, `ft26-olmocr-trunc02-dominy_group{1,3,2}` (0.02), then `ft28-all-olmocr-trunc02` and `candidate-accounts-trunc02`. Inferred: folds done about 15:40 (GPU 2) and 16:30 UTC (GPU 1); any gated submission by about 19:00 UTC | `ft25-*`, `ft26-*`, `ft27`, `ft28`, `candidate-accounts-trunc10`, `candidate-accounts-trunc02` |
+| 11-10 | Loss-function arms read out | | Measured, held-out, A5000, `22b6918`, epoch 3, groups 1, 3, 2. Truncation 0.05 (`ft21`): 0.2777, 0.2153, 0.2520, mean 0.2483 against ft6 0.2587, gain 0.0104, passes; `ft23-all-olmocr-trunc` started 08:40 UTC, then `submission-07`. Smoothing 0.1 (`ft22`): 0.2682, 0.2394, 0.2632, mean 0.2569, gain 0.0018, fails; `ft24` and `candidate-accounts-smooth` correctly did not run. Against ft6 per group at epoch 3 (0.3053, 0.2190, 0.2519), truncation's gain is almost all group 1 (-0.028; group 3 -0.004, group 2 +0.000), where ft6 got worse from epoch 2 to 3. Against ft6's best epochs (mean 0.2452) truncation is not better, so inferred: truncation mainly stops the late-epoch drift, rather than reading better. Both arms are scored against machine drafts only (groups 1-3 have no expert page). The workspace alert's "stopped" text at 07:20 UTC was false (both up, training uninterrupted): the Mac was asleep and the checks ran during its short wakes; fixed by clearing missed checks after a wall-clock gap | `ft21-*`, `ft22-*`, `ft23`, `ft24`, `submission-07`, `candidate-accounts-smooth` |
+| 11-10 | Loss-function arms queued on the account books | Accounts carry most of the macro error (about 0.26 held-out against German 0.066); 34 of 36 account pages have machine-draft labels; learning rate 2e-4 (Churro, 11-07) and the vision LoRA (both bases) gave accounts nothing | New training options `label_smoothing` and `loss_truncation` (drop each batch's highest-loss target tokens), off by default, identical to the old loss when off (test, 95 pass on EFabric; PR #12, `22b6918`, clone `~/badger-scribe-run-k`). Queued 03:40 UTC, both against ft6 0.2587 at epoch 3 with `gate.py`, ft6 settings otherwise: GPU 1 `ft21-olmocr-trunc-dominy_group{1,3,2}` (truncation 0.05), then `ft23-all-olmocr-trunc` and `submission-07` only if it passes; GPU 2 `ft22-olmocr-smooth-dominy_group{1,3,2}` (smoothing 0.1), then `ft24-all-olmocr-smooth` and `candidate-accounts-smooth`. Caveat: fold scores are against machine drafts, so a loss that ignores draft errors can look worse on folds and still help on expert labels; a narrow gate failure is inconclusive. Inferred: about 5 h per arm, 7.5 h to a submission | `ft21-*`, `ft22-*`, `ft23`, `ft24`, `submission-07`, `candidate-accounts-smooth` |
+| 11-10 | `submission-06` scored | | Submitted by Ian 11-09 (CST), public score 0.124 reported by Ian: 0.002 better than submission-05, a tie under the 0.005 rule; 0.005 better than submission-04, right at the tie line. Only German rows changed (139 of 141), so this is the German lr 2e-4 vision LoRA alone. Inferred: if the public score is a macro mean over the three categories, public German CER fell by about 0.006, in line with the fold gain of 0.0062 | `submission-06`, `ft16b-all-kade-vis-lr2e4` |
+| 11-10 | Results of the 11-10 queue | | Measured, held-out, A5000, `36aa461`. olmOCR LoRA on account books only (`ft19`), epochs 1-3: group 1 0.4052, 0.4244, 0.5116; group 2 0.2809, 0.2981, 0.2923; group 3 0.2334, 0.2393, 0.2329; epoch-3 mean 0.3456 against ft6 (accounts plus survey) 0.2587, much worse, so training on survey pages too helps the account books; gate failed, `ft20` and `submission-07` correctly did not run. `ft16b-all-kade-vis-lr2e4` finished all 111 steps with no error (the metrics fix held). `submission-06` (German `ft16b`, survey `ft12-all-english`, accounts `ft13-all-olmocr-english`): 208 pages, 0 empty, 0 loop cuts, 18.37 GiB, 38.5 min, `36aa461` clean. Copied to the Mac and Desktop 11-10 03:01 UTC, hashes match, page ids match the sample in order. Measured by count only: survey 31/31 and accounts 36/36 rows byte-identical to submission-05 even though the base models now load by pinned Hugging Face id from `/models` (same weights, same output); German 2/141 identical. Not submitted yet | `ft19-*`, `ft16b`, `submission-06` |
+| 11-10 | Why `ft16-all-kade-vis-lr2e4` died, and the rerun | Its folds passed; it failed 4 min into epoch 2 | Measured from its events and log: `OSError: [Errno 9] Bad file descriptor` from `MetricWriter`, which held `metrics.jsonl`/`metrics.csv` open on the JuiceFS home for the whole run; epoch 1 had saved a checkpoint and adapter, peak 11.7 GiB. Same failure class as `ft10-base-kade128` and `ft10-lr2e4-kade007`. Fix: open, append and close per write; TensorBoard errors become a warning (PR #11, `36aa461`, 94 tests pass). Queued 01:24 UTC from clone `~/badger-scribe-run-j` (`36aa461` = main with PR #9 and #10, plus this fix), `HF_HUB_CACHE=/models HF_HUB_OFFLINE=1` set in `queue_lib.sh`: GPU 2 `ft16b-all-kade-vis-lr2e4` (new run id, from scratch) then `submission-06`; GPU 1 `ft19-olmocr-accounts-dominy_group{1,3,2}` (olmOCR LoRA on account books only, curriculum `dominy`), `ft20-all-olmocr-accounts` if they beat ft6 0.2587 at epoch 3 by 0.005, then `submission-07`. GPU 2 is now at 128.105.218.241 | `ft16`, `ft16b`, `ft19-*`, `ft20`, `submission-06`, `submission-07` |
+| 11-09 | Read out 11-08's queue from the dashboard's cached run data (workspaces stopped early, 18:26 UTC 11-08, about 10 h before their 24 h limit) | | Measured, held-out, A5000, epoch 3. German vision LoRA + lr 2e-4: kade_007 0.0796, kade_103 0.0638, kade_128 0.0560, mean 0.0665 against vision LoRA at 1e-4 0.0727: gain 0.0062, passes the gate (0.0677). But `ft16-all-kade-vis-lr2e4` failed at 10:04 UTC about 15 min after starting; cause not read yet (log on EFabric), so `submission-06` never ran. olmOCR vision LoRA on account groups 1-3: epoch 3 0.3951, 0.2851, 0.2216, mean 0.3006 against ft6 0.2587, much worse (group 1 jumps from 0.2652 at epoch 2); gate failed, so `ft18` and `submission-07` correctly did not run. Best epochs (0.2652, 0.2544, 0.2137) match ft6's (0.2647, 0.2519, 0.2190): no gain from the vision LoRA on account books | `ft15-*`, `ft16-all-kade-vis-lr2e4`, `ft17-olmocr-vis-*` |
+| 11-08 | Queued for submissions 06 and 07, each gated by the plan's three-fold rule (mean gain of at least 0.005 at epoch 3, `runs/pm/bin/gate.py`) | Ian: more fine-tuning before Sunday night's uploads. Freed 29 GB of finished checkpoints (Ian approved) after `ft15-vis-lr2e4-kade007`/`128` stopped on a full disk | GPU 2: `ft15-vis-lr2e4-kade007`, `kade128` rerun; `ft16-all-kade-vis-lr2e4` trains only if the three ft15 folds beat `ft11-vis` 0.0727; `submission-06` = submission-05 with ft16. GPU 1: `smoke-olmocr-vis` (5 steps, largest pages) measured 20.1 GiB peak with the vision LoRA, the same as without it, rc 0; then `ft17-olmocr-vis-dominy_group{1,3,2}`; `ft18-all-olmocr-vis-english` only if they beat `ft6` 0.2587; `submission-07` = best German (ft16 else ft14) with ft18 | `smoke-olmocr-vis`, `ft15-*`, `ft16-*`, `ft17-*`, `ft18-*`, `submission-06`, `submission-07`, main `8fbc07d` |
+| 11-08 | submission-05 queued: all-data German vision LoRA | Steps 10 and 11 found the vision LoRA the best German setting (0.0727 at epoch 3 against about 0.078 for the 4-epoch setting in submissions 03 and 04) | Queued 04:47 UTC from main `8fbc07d`, clone `~/badger-scribe-run-h`. `ft14-all-kade-vis`: `all_train`, vision-inclusive LoRA, lr 1e-4, 3 epochs, default seed. `submission-05` changes only the German adapter from submission-04 and predicts only if `chk-vis-kade103` re-scores the `ft11-vis-kade103` adapter through `finetune.predict` within 0.02 of its 0.0708 (measured 05:12 UTC: 0.070831, the same as training's 0.070831 to six places, 125 pages, 0 loop cuts, 7.9 GiB, 24.4 min). Also queued: `ft15-vis-lr2e4-kade{103,007,128}`, vision LoRA with lr 2e-4, the untested combination. Inferred: about 70 min training, 40 min prediction | `ft14-all-kade-vis`, `submission-05`, `chk-vis-kade103`, `ft15-vis-lr2e4-*` |
+| 11-07 | Plan steps 10 and 11 read out: learning rate, length, and LoRA on the vision encoder | Runs finished overnight; only kade_103 at 2e-4 was logged before | Measured, held-out, A5000, seed 20261004, `b6d7d47`, CER at a fixed epoch on kade_007, kade_103, kade_128. Baseline (1e-4, 3 epochs) at epoch 3: 0.1023, 0.0866, 0.0691, mean 0.0860. 2e-4, 3 epochs: 0.0919, 0.0762, 0.0624, mean 0.0768. 1e-4, 6 epochs at epoch 4: 0.0910, 0.0746, 0.0673, mean 0.0776. 2e-4, 6 epochs at epoch 4: 0.0877, 0.0717, 0.0614, mean 0.0736. Vision-inclusive LoRA (1e-4, 3 epochs) at epoch 3: 0.0830, 0.0756, 0.0596, mean 0.0727. Every arm beats the baseline on all three folds. `ft12-all-kade` (in submissions 03 and 04) is the 1e-4, 4-epoch setting, about 0.078 on these folds, so the vision LoRA or 2e-4 for 4 epochs would be about 0.004 to 0.005 better on German (inferred). Account books, vision LoRA at epoch 3 on groups 1-6: 0.4551, 0.2305, 0.2317, 0.3840, 0.3240, 0.3481, mean 0.3289 against ft5 0.3265, no gain. 2e-4 on accounts: no consistent gain (group 4 0.5469 at epoch 3). Not yet tried: vision LoRA together with 2e-4 | `ft10-*`, `ft11-vis-*`, `ft9-seed2-kade103` |
+| 11-06 | Fixed-epoch check of the olmOCR fold comparison | The 0.2452 mean took each fold's best epoch, chosen on its own held-out pages, while the all-data adapter in submission-04 is the epoch-3 one | Measured from the fold logs: olmOCR epoch 3 on groups 1-3 0.3053, 0.2519, 0.2190, mean 0.2587; epoch 2 mean 0.2534. Churro ft5 epoch 3 mean 0.2937. At epoch 3 olmOCR still leads by 0.035, past the 0.03 bar. Group 1 alone peaks at epoch 2; the epoch 2 vs 3 mean gap (0.005) is at the noise level, so 3 epochs stays | `ft6-olmocr2-dominy_group{1,2,3}`, `ft5-english-dominy_group{1,2,3}` |
+| 11-06 | olmOCR-2-7B LoRA folds on account-book groups 1 to 3, and submission-04 queued | Plan step 6 follow-up; decide whether accounts move to olmOCR | Measured, held-out, A5000: groups 1, 2, 3 0.2647, 0.2519, 0.2190 against ft5 0.3553, 0.2571, 0.2602; mean 0.2452 against 0.2909, -0.046, past the 0.03 bar, though group 2 alone is only -0.005. Only accounts were tested, so survey stays on Churro. New code: `finetune.predict --base CATEGORY=CONFIG` decodes a category with another config's base, one base loaded at a time (91 finetune tests pass on EFabric). Queued 22:02 UTC: `chk-two-model-group1` re-decodes group 1 through the new path and must reproduce 0.2647 within 0.02 before `submission-04` predicts (measured 22:04 UTC: 0.26466, the same as training's 0.26466 to five places, 0 loop cuts, 16.87 GiB, 2.7 min); `ft13-all-olmocr-english` (all 619 train pages); `ft6-olmocr2-survey_011` to test olmOCR on survey (measured, held-out: epochs 1-3 0.1203, 0.1193, 0.1175, against Churro ft4 0.1090 and ft9 seeds 0.0962, 0.0948, so survey stays on Churro). Inferred: about 110 min training, 50 min prediction | `ft6-olmocr2-dominy_group{1,2,3}` (`77bd396`); `chk-two-model-group1`, `ft13-all-olmocr-english`, `submission-04`, `ft6-olmocr2-survey_011` (`5e21f06`, local branch `ian/two-model-predict`, clone `~/badger-scribe-run-g`) |
+| 11-06 | All-data Churro adapters and submission-03 queued (GPU 2) | Ian asked for the next submission to be created automatically after its fine-tunes. New code: a fold with nothing held out saves the last epoch's adapter instead of scoring (84 finetune tests pass) | Queued at 12:20 UTC, not yet run. German: committed config, 4 epochs (the best length on the 6-epoch folds, two of three peaked at epoch 4), lr 1e-4. English: committed English config unchanged (3 epochs, lr 1e-4, human x3). Fold `all_train` = all 619 train pages, none held out, so these adapters have no held-out score. Then `finetune.predict` on the test set with them. Inferred: about 50 and 75 min of training, 40 min of prediction | `ft12-all-kade`, `ft12-all-english`, `submission-03`, `1b3f012` (local, branch `ian/all-data-training`, clone `~/badger-scribe-run-f`) |
+
+## 8. Results
+
+### Zero-shot Churro-3B, by held-out fold
+
+| Fold | Pages | No guard | Loop guard | Loop cuts |
+|---|---|---|---|---|
+| kade_007 | 77 | 0.3196 | 0.2309 | 12 |
+| kade_103 | 125 | 0.2684 | 0.2136 | 14 |
+| kade_112 | 11 | 0.3037 | 0.2466 | 1 |
+| kade_128 | 82 | 0.2351 | 0.1980 | 9 |
+| **German** | **295** | **0.274** | **0.215** | **36** |
+| survey_001 | 35 | | 0.1774 | 5 |
+| survey_002 | 11 | | 0.2560 | 4 |
+| survey_003 | 54 | | 0.3659 | 18 |
+| survey_004 | 27 | | 0.2224 | 6 |
+| survey_006 | 5 | | 0.5008 | 2 |
+| survey_007 | 34 | | 0.3673 | 13 |
+| survey_009 | 40 | | 0.2934 | 11 |
+| survey_010 | 35 | | 0.2624 | 7 |
+| survey_011 | 47 | | 0.2841 | 13 |
+| **Survey** | **288** | | **0.292** | **79** |
+| dominy_group1 | 6 | | 0.6384 | 3 |
+| dominy_group2 | 6 | | 0.3503 | 1 |
+| dominy_group3 | 6 | | 0.3036 | 1 |
+| dominy_group4 | 6 | | 0.5253 | 1 |
+| dominy_group5 | 6 | | 0.3795 | 1 |
+| dominy_group6 | 6 | | 0.5599 | 2 |
+| **Accounts** | **36** | | **0.459** | **9** |
+
+On human-labeled pages only, with the guard: survey 0.358 (16 pages), accounts 0.258 (2 pages). The 37 looping German pages were counted offline in the no-guard run; the live guard fired on 36.
+
+### Fine-tuned, CER per epoch
+
+| Held out | Pages | Epoch 1 | Epoch 2 | Epoch 3 | Run |
+|---|---|---|---|---|---|
+| kade_103 | 125 | 0.1032 | 0.0873 | **0.0868** | `churro-bf16-ft-kade103` |
+| kade_007 | 77 | 0.1149 | 0.1040 | **0.1004** | `churro-bf16-ft-kade007` |
+| kade_128 | 82 | 0.0816 | 0.0705 | **0.0689** | `churro-bf16-ft-kade128` |
+| kade_112 | 11 | 0.1499 | **0.1365** | lost | `ft2-kade_112` |
+| survey_003 | 54 | **0.0490** | 0.0564 | lost | `ft3-english-survey_003` |
+| survey_011 | 47 | 0.1231 | 0.1107 | **0.1090** | `ft4-english-survey_011` (fixed augmentation) |
+| dominy_group5 | 6 | 0.3541 | 0.3427 | **0.3011** | `churro-bf16-ft-english-dominy_group5` |
+
+**German overall: 0.0872** (page-weighted over 295 pages, with kade_112 at epoch 2). Fine-tuned runs had 0 loop cuts at every evaluation. On kade_103 at epoch 3: WER 0.201, length ratio 0.973.
+
+**survey_011 on human-labeled pages alone (2 pages):** 0.0660, 0.0541, 0.0534 per epoch. Two pages are too few to lean on.
+
+**Run-to-run noise (2 repeats, measured):** repeating the same settings gave survey_003 epoch 1 of 0.0439 and 0.0490, and kade_112 epoch 1 of 0.1463 and 0.1499. So differences under about 0.005 mean little. The survey_003 rise from 0.0490 to 0.0564 is only slightly above that, so it doesn't prove overfitting.
+
+**Page-level metrics for runs on EFabric** (kade_007, kade_128, kade_112, survey_003, dominy_group5) are in home but weren't copied to this machine. Human-only CER on those folds hasn't been computed.
+
+### Kaggle leaderboard
+
+| Run | Submitted | Public score | German adapter | English adapter |
+|---|---|---|---|---|
+| `submission-01` | 11-03 | 0.143 | `ft2-kade_112` | `churro-bf16-ft-english-dominy_group5` |
+| `submission-02` | 11-05 | 0.150 | `ft2-kade_112` | `ft4-english-survey_011` |
+| `submission-03` | 11-06 | 0.138 | `ft12-all-kade` | `ft12-all-english` |
+| `submission-04` | 11-06 | 0.129 | `ft12-all-kade` | survey `ft12-all-english` (Churro), accounts `ft13-all-olmocr-english` (olmOCR-2-7B) |
+| `submission-05` | 11-08 | 0.126 | `ft14-all-kade-vis` (vision LoRA) | survey `ft12-all-english` (Churro), accounts `ft13-all-olmocr-english` (olmOCR-2-7B) |
+| `submission-06` | 11-09 | 0.124 | `ft16b-all-kade-vis-lr2e4` (vision LoRA, lr 2e-4) | survey `ft12-all-english` (Churro), accounts `ft13-all-olmocr-english` (olmOCR-2-7B) |
+| `submission-07` | 11-10 | 0.124 | `ft16b-all-kade-vis-lr2e4` | survey `ft12-all-english` (Churro), accounts `ft23-all-olmocr-trunc` (olmOCR-2-7B, loss truncation 0.05) |
+
+### Decoding and post-processing experiments
+
+| Experiment | Scope | Before | After | Decision |
+|---|---|---|---|---|
+| Loop guard | German zero-shot | 0.274 | 0.215 | Keep on |
+| Sampled retry | 37 looping German pages | 0.531 | 0.380 | Off: 20 pages better, 13 worse, 3 still at or above 0.99 |
+| Sampled retry | All German zero-shot | 0.215 | 0.196 | Off: only helps models that loop |
+| Fold stray characters to the allowed set | Survey zero-shot | 0.2918 | 0.2883 | Not built |
+| Same | Accounts zero-shot | 0.4595 | 0.4578 | Not built |
+| Same | German zero-shot | 0.2150 | 0.2149 | Not built |
+| Same | German fine-tuned, kade_103 | 0.0868 | 0.0868 | Not built: fine-tuning already fixes these |
+
+Retry attempts by temperature: 21 at 0.3, 10 at 0.6, 4 at 0.9 (used on 35 of 37 pages).
+
+## 9. Run registry
+
+Runs are in `~/badger-scribe-bucherwurm/runs/finetune/` on EFabric home. Local copies of some are in `runs/efabric/` (git-ignored).
+
+| Run ID | When (UTC) | GPU | Outcome |
+|---|---|---|---|
+| `smoke-churro-bf16` | 10-17 03:08 | A100 | Smoke test |
+| `churro-bf16-zeroshot-kade` | 10-17, ended about 04:47 | A100 | Complete |
+| `churro-bf16-zeroshot-kade-guard` | 10-17, ended about 05:41 | A100 | Complete |
+| `churro-bf16-ft-kade103` | 10-17 05:48-07:06 | A100, shared | Complete |
+| `churro-bf16-zeroshot-english` | 10-17, ended about 07:33 | A100, shared | Complete |
+| `churro-bf16-retry-kade` | 10-17, ended about 07:53 | A100 | Complete |
+| `churro-bf16-ft-kade007` | 10-17 from 11:11 | A100, shared | 3 epochs scored; final checkpoint save failed |
+| `churro-bf16-ft-kade128` | 10-17 | A100, shared | 3 epochs scored; final checkpoint save failed |
+| `churro-bf16-ft-kade112` | 10-17 | A100, shared | Epoch 1 scored (0.1463), then crashed at a checkpoint |
+| `churro-bf16-ft-english-survey_003` | 10-17 from 11:12 | A100, shared | Epoch 1 scored (0.0439), then crashed at a checkpoint |
+| `churro-bf16-ft-english-dominy_group5` | 10-17 | A100, shared | 3 epochs scored; final checkpoint save failed |
+| `ft2-kade_112` | 10-17 19:56-20:18 | A100, shared | 2 epochs scored; workspace restarted |
+| `ft2-english-survey_003` | 10-17 19:56-20:18 | A100, shared | No score; workspace restarted |
+| `ft3-english-survey_003` | 10-18 18:36-20:04 | A5000 | 2 epochs scored; workspace restarted |
+| `ckpt-test` | 10-19 00:02-00:09 | A5000 | Test only: 4 + 4 steps on kade_112 |
+| `smoke-1103` | 11-03 04:18-04:25 | A5000 | Test only: 4 + 4 steps on kade_112, stopped and resumed. Complete |
+| `ft4-english-survey_011` | 11-03 04:27-06:09 | A5000 (second workspace) | Hold out survey_011, `runs/english.yaml`, 116 steps. First full-length run of the 11-02 code, with the fixed augmentation. Complete, 0.1090 |
+| `check-german-1103` | 11-03 04:25-04:27 | A5000 | Fold check of `ft2-kade_112` on kade_112. Complete, 0.1348 |
+| `check-english-1103` | 11-03 04:27-04:28 | A5000 | Fold check of `churro-bf16-ft-english-dominy_group5` on dominy_group5. Complete, 0.3014 |
+| `submission-01` | 11-03 04:30-05:07 | A5000 | Test set: German `ft2-kade_112`, English `churro-bf16-ft-english-dominy_group5`. Complete, 208 pages. Copy on the Mac in `runs/finetune/submission-01/`. Submitted 11-03, public score 0.143 |
+| `ft5-english-dominy_group1` to `6` | 11-04 20:55 to 11-05 04:40, in order 1, 6, 4, 2, 3, 5 | A5000 (second workspace) | Complete. Hold out each account-book group, `b6d7d47`, `finetune/configs/churro-3b-bf16-english.yaml`. 36 pages 0.3265 |
+| `dec-base-kade103`, `dec-rp10-kade103`, `dec-rp10-survey011`, `dec-rp10-group5` | 11-04 21:00-22:07 | A5000 | Fold decodes, training pages. Complete, `5a79080` clean. 0.0873, 0.0898, 0.1139, 0.2975 |
+| `dec-2mp-kade103`, `dec-2mp-group5`, `dec-4mp-survey011` | 11-04 22:07-22:46 | A5000 | Fold decodes, training pages. Complete, `5a79080` clean. 0.0934, 0.2963, 0.1353 |
+| `submission-02` | 11-05 00:35-01:14 | A5000 | Test set: German `ft2-kade_112`, English `ft4-english-survey_011`. Complete, 208 pages, `b6d7d47` clean. Copy on the Mac in `runs/finetune/submission-02/`, hashes match. Submitted 11-05, public score 0.150; worse than submission-01 by 0.007 |
+| `ft14-all-kade-vis` | 11-08 04:47-05:23 UTC | A5000 | All 295 German train pages, vision-inclusive LoRA, lr 1e-4, 3 epochs (111 steps), main `8fbc07d`. Complete; last epoch kept, `best_cer` written as null |
+| `ft16-all-kade-vis-lr2e4` | 11-08 from about 09:49 UTC | A5000 | All 295 German train pages, vision-inclusive LoRA, lr 2e-4, 3 epochs. Failed about 4 min into epoch 2 with `OSError: [Errno 9]` from the metrics writer; folder kept |
+| `ft16b-all-kade-vis-lr2e4` | 11-10 from 01:24 UTC | A5000 | Rerun of `ft16` from scratch, `36aa461` (PR #11 metrics fix). Complete, 111 steps; last epoch kept |
+| `submission-06` | 11-10, after `ft16b` | A5000 | Test set: German `ft16b-all-kade-vis-lr2e4`, survey `ft12-all-english` (Churro), accounts `ft13-all-olmocr-english` (olmOCR). Complete, 208 pages, 0 empty, 0 loop cuts, 18.37 GiB, 38.5 min, `36aa461` clean. Copied to the Mac and Desktop 11-10 03:01 UTC, hashes match. Survey and accounts rows byte-identical to submission-05, German 2 of 141. Submitted 11-09 (CST), public score 0.124 reported by Ian: a tie with submission-05 under the 0.005 rule |
+| `submission-05` | 11-08 05:23-06:02 UTC | A5000 | Test set: German `ft14-all-kade-vis`, survey `ft12-all-english` (Churro), accounts `ft13-all-olmocr-english` (olmOCR). Complete, 208 pages, 0 empty, 0 loop cuts, 18.37 GiB, 39.2 min, main `8fbc07d` clean. Copied to the Mac 11-08 06:57 UTC, hashes match, page ids match the sample in order. Measured by count only: survey 31 of 31 and accounts 36 of 36 rows byte-identical to submission-04, German 0 of 141, so any public change comes from the German adapter. Submitted 11-08, public score 0.126 reported by Ian: 0.003 better than submission-04, a tie under the 0.005 rule. Inferred: if all three categories are in the public split, public German CER fell by about 0.009 |
+| `submission-04` | 11-06 23:41 to 11-07 00:18 UTC | A5000 | Test set: German `ft12-all-kade` and survey `ft12-all-english` on Churro-3B, accounts `ft13-all-olmocr-english` on olmOCR-2-7B, one base loaded at a time. Complete, 208 pages, 0 empty, 0 loop cuts, 18.37 GiB, 37.0 min, `5e21f06` clean. Copied to the Mac 11-07 00:23 UTC, hashes match, page ids match the sample in order. Submitted 11-06 after the UTC reset, public score 0.129 reported by Ian: 0.009 better than submission-03. Measured by count only: German 141 of 141 and survey 31 of 31 rows byte-identical to submission-03, accounts 0 of 36, so the whole change comes from the account-book model. Inferred: if all three categories are in the public split, the public accounts CER fell by about 0.027 |
+| `submission-03` | 11-06 14:42-15:20 UTC | A5000 (second workspace) | Test set: German `ft12-all-kade`, English `ft12-all-english` (both trained on all 619 train pages). Complete, 208 pages, 0 empty, 1 loop cut, 8.87 GiB, 37.9 min, `1b3f012` clean. Copied to the Mac 11-06 21:39 UTC, hashes match, page ids match the sample. Submitted 11-06, public score 0.138 reported by Ian: 0.012 better than submission-02 and 0.005 better than submission-01, right at the tie line |
+| `screen-churro-zs` | 11-05 01:46-02:18 | A5000 | Churro-3B zero-shot on 36 account pages and survey_011, for step 6. Complete: accounts 0.4628, survey_011 0.2806 |
+| `dec-2mp-dominy_group1` to `6` | 11-05 04:41-04:50 | A5000 (second workspace) | Fold decodes at 2 MP, training pages. Complete, `b6d7d47` |
+| `ft8-repeats-dominy_group1` to `6` | 11-05 04:50-13:14 | A5000 (second workspace) | Hold out each account-book group with `category_repeats: {dominy_accounts: 3}`, `f45560a`. Complete, 36 pages 0.3219 |
+| `ft9-seed2-survey011`, `ft9-seed3-survey011` | 11-05 17:15 to 22:38 | A5000 | Seeds 20261004, 20261005 on survey_011, `b6d7d47`. Complete: 0.0962, 0.0948 (seed3 resumed on the new workspace from its epoch-2 checkpoint) |
+| `ft9-seed2-kade103`, `ft9-seed3-kade103` | 11-05 17:15 to 20:12 | A5000 (second workspace) | Same on kade_103. Complete: 0.0866, 0.0868 |
+| `dec-noretry-dominy_group1` to `6`, `dec-retry-dominy_group1` to `6` | 11-05 22:02-22:23 | A5000 | Fold decodes of the ft5 adapters, training pages, without and with loop retry. Complete, `b6d7d47` clean. 36 pages 0.3265 and 0.3269 |
+| `ft10-base-kade007`, `ft10-base-kade128` | 11-05 22:38 to 23:59 | A5000 | Step 10 baselines, seed 20261004, `b6d7d47`. kade_007 complete, 0.1023. kade_128 failed after epoch 1 (0.0802), exit 120, no checkpoint; folder kept |
+| `ft10-base-kade128-r2` | 11-06 | A5000 | Rerun of `ft10-base-kade128`, same config |
+| `ft10-lr2e4-kade103` | 11-05 22:23 to 23:54 | A5000 (second workspace) | Learning rate 2e-4, seed 20261004, `b6d7d47`. Complete, 0.0762 |
+| `screen-olmocr2-zs`, `screen-yale-lighton3-zs`, `screen-lighton3-zs` | 11-05 23:54 to 11-06 00:48 | A5000 (second workspace) | Complete on 83 held-out training pages each. Accounts 0.3556, 0.3188, 0.3365; survey 0.1846, 0.3061, 0.3116. Loop cuts 1, 3, 1 |
+| `ft10-lr2e4-kade007` | 11-05 23:59 to 11-06 00:58 | A5000 | All three evals complete; best 0.0919 at epoch 3. Failed rc 120 before saving the epoch-3 adapter or a finished event; retained `best_adapter` is epoch 2 |
+
+A workspace listing on 11-03 found `best_adapter` in all 10 earlier runs that scored a fine-tuned or smoke epoch. The zero-shot and retry runs and `ft2-english-survey_003` have none, as expected.
+
+Old 7.4 GB checkpoints were deleted on 10-19, at Ian's request. Metrics, predictions and adapters were kept, but those runs can't be resumed.
+
+## 10. Infrastructure problems
+
+| Problem | Cause | Status | Fix |
+|---|---|---|---|
+| High GPU memory in the first epoch | Model left in eval mode | Measured: 26.5 vs 10.9 GB for one batch | `6e99ba8` |
+| Runs crashed saving checkpoints | Disk quota on 64 GB home; each checkpoint held the full model (7.4 GB) | Confirmed from error logs | Trainable-only checkpoints, 0.34 GB, `8e39104` |
+| Workspace restarted, twice | Each came about a minute after a second 7.4 GB checkpoint reached `/tmp`, so likely the pod's storage limit | **Inferred from timing**, not confirmed in EFabric's event log. The new code finished one full-length run on 11-03 (1 h 42 min) with no restart, which fits this but doesn't prove it | Checkpoints no longer go to `/tmp` |
+| Training runs exited 120 with "Bad file descriptor" while writing progress output (`ft10-base-kade128`, `ft10-lr2e4-kade007`) | The handle to the log file on the shared network home stopped working during an evaluation | **Inferred**, two GPU 1 occurrences immediately after evaluation | `local_log.sh` now writes the live log to container-local disk and appends it afterward; mitigation not yet confirmed by a completed run |
+
+## 11. Known limitations to disclose or fix
+
+From the PR #4 review. All current models were trained with these in place.
+
+| Issue | Effect on results | Status |
+|---|---|---|
+| The noise step turned the whole page grayscale | About 14% of training pages lost color (0.8 × 0.18) in **all reported runs**, while inference always sees color. Effect on CER unknown | Code fixed 11-02; effect not yet measured |
+| Repeated human pages got identical augmentation within an epoch | In the English runs, `human_repeats` added loss weight but no image variety | Code fixed 11-02 |
+| On English folds the best epoch is chosen mostly on machine drafts | Selection can reward imitating the drafting model, which the challenge warns about. survey_003 is 52 draft and 2 human pages | Still chosen on all pages, since 2 pages is too few to choose on. Human-only CER is now logged for future runs; check it alongside |
+| Step count is slightly short | The last 1-3 optimizer steps of a run are dropped (kade_103: 64 steps, not 66). Small, since learning rate is near zero by then | Open |
+| Folds train on pages in the frozen Release 09 holdout | Fold adapters must not be scored on that holdout | Docs corrected 11-02; the behavior is intended |
+| A rerun under a finished run's ID could overwrite its `best_adapter` | Old runs' checkpoints were deleted, which left their adapters exposed | Fixed 11-02: preflight now refuses |
+| `kade_112` score is from epoch 2 of a cut-off run | Learning rate hadn't finished decaying | Known |
+| Only 2 survey notebooks have been scored; account books now have all 6 folds | Survey estimates remain weak and the two notebooks differ (0.049, 0.109). Account fold labels are mostly machine drafts, so six-fold coverage does not solve label validity | Open for survey; account priority is better labels, not more folds |
+| Spread images aren't split into single pages | Zero-shot survey errors are largely reading order. Fine-tuned behavior hasn't been examined | Open |
+
+## 12. Error analysis
+
+Tallied from predictions with a character diff. Word-pair counts apply only to the word list checked.
+
+**German, fine-tuned (kade_103, epoch 3):**
+- **Spelling modernization:** across 7 of the writer's non-standard spellings (such as kamm to kam, muste to musste, bischen to bisschen), zero-shot kept the writer's spelling 33 times and modernized it 42 times. Fine-tuned kept it 81 times and modernized it 41 times. This is the model's modern-German habit. **Nothing in our pipeline normalizes text on purpose, and output must stay verbatim.**
+- **Punctuation and case:** `.` read as `,` (136), `D` as `d` (70), `d` as `D` (38), `k` as `K` (23), `H` as `h` (22).
+- **Letter confusions:** `e`/`n`, `r`/`n`, `n`/`m`, `e`/`a`.
+- **Postmark lines:** these cost 0.0132 CER on this fold (0.0868 would be 0.0736 without them, 31 of 125 pages). No model can read text that isn't on the page. Planned response: report it in the Kaggle Label corrections thread (not yet posted).
+
+**English, zero-shot:**
+- Reading order across spreads (example: survey_003_p0005 dumps the rest of the left page at the end).
+- Wrong symbols: `º` for `°`, `&amp;` or `+` for `&`, `Π`/`π` for `N`, `1/4` for `¼`.
+- Describing images instead of transcribing (example: dominy_002_p003, an envelope).
+
+`benchmark/error_report.py` builds the page-by-page review; reports are in `runs/reports/` and must not be published because they contain label text.
+
+## 13. Planned experiments
+
+Ranked by expected value after the 11-11 readout. Completed and rejected arms live in section 7 rather than this active list.
+
+| Priority | Experiment | Success check | Status / reason to keep |
+|---|---|---|---|
+| 1 | Correct or consensus-rebuild the 34 machine-draft account labels, starting with pages where independent open models disagree | Human-only held-out CER, with draft-label CER secondary | Highest-upside bottleneck. Fold gains against drafts have not transferred to the leaderboard. Human correction is allowed only on training pages |
+| 2 | Fold-only image-plus-draft correction: one existing open model produces a draft and another sees both the page and draft | Beat the best single-pass model on human-labeled pages without modernization or unsupported text | Best fully automated lead from the research review; test before changing the submission pipeline |
+| 3 | Zero-shot screen Chandra OCR 2 on the frozen training-page screen | Beat the current category base by at least 0.03 on the existing screen | New 5B candidate with strong document/handwriting results. Blocked from submission use until its modified OpenRAIL restriction is confirmed compatible with the competition |
+| 4 | Split survey spreads into page halves and merge in reading order | Paired gain on both scored survey notebooks, with no account/German change | Survey's remaining errors are visibly dominated by spread reading order; lower priority because accounts contribute more error |
+| 5 | Final release package | Selected final prediction, public adapters, `WRITEUP.md`, required submission card and scaling section, attribution, and pinned tag | Required before the final deadline; LICENSE already exists |
+
+Dropped as not worthwhile now: catalog metadata (already hurt every category zero-shot), a combined model (category routing is stronger and safer), further no-augmentation work (three folds were worse overall), more label-smoothing/truncation strengths or rare-character weighting (optimizes unreliable drafts), sequence-level CER training (high complexity before label repair), seed voting, higher image budgets, and additional LightOn fine-tuning.
+
+## 14. Compliance notes for the writeup
+
+- **Open weights in the run:** Churro-3B plus our LoRA adapters. No closed model runs in the pipeline.
+- **`label_source`:** used only in training (`human_repeats`) and in reporting. Never used at inference: `finetune/predict.py` drops it when reading pages, and a test checks that decoding never receives it.
+- **Test images:** a scan of the 4 local Claude Code transcripts for this project (2026-11-02) found no test page image, by filename. Teammates' tools weren't scanned.
+- **Closed-model use in preparation (must be disclosed):** Claude Code was used as a coding assistant and viewed a few training page images and error reports while debugging.
+- **Required for submission, not done:** public adapters, `WRITEUP.md` with the submission card and "Scaling to unlabelled pages" section, required attribution, submitted predictions CSV, and a pinned tag. `LICENSE` exists.
+
+**Submission card values known so far:** `models: stanford-oval/churro-3B plus our LoRA adapters`; `external_data: released train set only`; `hardware: RTX A5000 24 GB`. From `submission-01`, to be replaced by the final run's values: `peak_vram: 8.9 GB`, `eval_wall_clock: 37 min`, `leaderboard_cer: 0.143`. The card needs the score of whichever submission is selected as final.
+
+## 15. Reproducing a run
+
+```bash
+python -m finetune.prep
+python -m finetune.folds
+
+# German, hold out one letter
+accelerate launch --num_processes 1 --mixed_precision no -m finetune.train \
+  --config finetune/configs/churro-3b-bf16.yaml --fold runs/folds/kade_103.json --run-id <id>
+
+# Continue a stopped run, then check on it
+accelerate launch --num_processes 1 --mixed_precision no -m finetune.train \
+  --config finetune/configs/churro-3b-bf16.yaml --fold runs/folds/kade_103.json --run-id <id> --resume
+python -m finetune.status <id>
+
+# Check a saved adapter on a fold it held out, then predict the test set
+python -m finetune.predict --config finetune/configs/churro-3b-bf16.yaml --run-id <id> \
+  --fold runs/folds/kade_112.json --adapter kade_letters=<german adapter>
+python -m finetune.predict --config finetune/configs/churro-3b-bf16.yaml --run-id <id> \
+  --adapter kade_letters=<german adapter> --adapter survey_notes=<english adapter> --adapter dominy_accounts=<english adapter>
+```
+
+The English config used so far is `churro-3b-bf16.yaml` with `curriculum: dominy-survey` and `human_repeats: 3`. It's in `runs/english.yaml` on EFabric and isn't in the repo yet, so it should be committed before the final runs. Rerunning a finished run's ID is now refused, so use a new `--run-id`. The `checkpoint_root` option was removed on 2026-11-02, so that key in `runs/*-efabric.yaml` is now ignored and checkpoints stay in the run directory.
