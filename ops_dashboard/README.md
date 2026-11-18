@@ -51,9 +51,13 @@ after the workspaces stop. Use `--offline` to skip EFabric and `--no-open` to sk
 - Latest submission by collection: the model and adapter used for each collection, with
   a held-out CER estimated from fold runs trained the same way.
 - To do: your agents' tasks that are waiting or blocked.
-- GPU workspaces: the running job, its epoch and progress, how long the job, the epoch
+- EFabric: the running job on each GPU workspace, its epoch and progress, how long the job, the epoch
   and the workspace have been running, time left before the 24-hour stop, GPU
   utilization, memory and queued jobs.
+- BadgerBrain: whether the gateway is reachable, its models and your key's metered spend, plus progress and CER for
+  runs made through it. To show models and spend, start the server with the key in its environment:
+  `OPENAI_API_KEY=$(op read 'op://<vault>/<item>/credential') python3 ops_dashboard/server.py`. The key stays in the
+  server process and never reaches the page. Without it, the section still shows reachability and local runs.
 - Agents: your coordinator and workers, by role. Agents report through `telemetry.py`;
   give every agent `WORKER_REPORTING.md`. A task counts as active only if it was
   reported in the last 5 minutes.
