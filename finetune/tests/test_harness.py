@@ -205,6 +205,20 @@ class BaseModelOptionTests(unittest.TestCase):
         torch.testing.assert_close(training_loss(model, batch, {"label_smoothing": 0.1}), smoothed)
 
 
+class Qwen38Tests(unittest.TestCase):
+    """Thinking stays off for Qwen3.5-family models."""
+
+    def test_thinking_is_off_for_this_family_and_untouched_for_others(self):
+        from finetune.vlm import _chat_text
+
+        class Processor:
+            def apply_chat_template(self, item, **kwargs):
+                return kwargs
+
+        self.assertIs(_chat_text(Processor(), [], True, {"model_family": "qwen3_5"})["enable_thinking"], False)
+        self.assertNotIn("enable_thinking", _chat_text(Processor(), [], True, {}))
+
+
 class FakeTokenizer:
     vocab = {1: "as", 2: " it", 3: " ####", 4: " put", 5: "#"}
 

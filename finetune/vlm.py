@@ -124,7 +124,8 @@ def messages(image: str | Path | Image.Image, text: str | None = None, max_pixel
 
 
 def _chat_text(processor, item, add_generation_prompt: bool, config: dict[str, Any]) -> str:
-    extra = {"enable_thinking": False} if config.get("model_family") == "lighton" else {}
+    # Qwen3.8's template thinks by default: it adds a reasoning system prompt and leaves <think> open.
+    extra = {"enable_thinking": False} if config.get("model_family") in {"lighton", "qwen3_5"} else {}
     return processor.apply_chat_template(item, tokenize=False, add_generation_prompt=add_generation_prompt, **extra)
 
 
