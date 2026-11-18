@@ -84,18 +84,17 @@ class MetricWriter:
         self.run_dir = run_dir
         self.accelerator = accelerator
         self.start = time.monotonic()
-        self.jsonl = (run_dir / "metrics.jsonl").open("a", encoding="utf-8")
+        self.jsonl_path = run_dir / "metrics.jsonl"
         self.csv_path = run_dir / "metrics.csv"
-        self.csv_file = self.csv_path.open("a", newline="", encoding="utf-8")
-        fields = [
+        self.fields = [
             "step", "elapsed_seconds", "epoch", "stage", "train_loss", "learning_rate", "gradient_norm",
             "examples_per_second", "peak_gpu_memory_mb", "val_macro_cer", "val_wer", "val_length_ratio",
             "val_runaway_count", "val_loop_cuts", "val_cer_kade_letters", "val_cer_dominy_accounts", "val_cer_survey_notes",
             "val_human_macro_cer", "val_human_pages",
         ]
-        self.writer = csv.DictWriter(self.csv_file, fieldnames=fields, extrasaction="ignore")
-        if self.csv_file.tell() == 0:
-            self.writer.writeheader()
+        if not self.csv_path.exists() or self.csv_path.stat().st_size == 0:
+            with self.csv_path.open("a", newline="", encoding="utf-8") as handle:
+                csv.DictWriter(handle, fieldnames=self.fields).writeheader()
         from torch.utils.tensorboard import SummaryWriter
 
         self.tensorboard = SummaryWriter(run_dir / "tensorboard")
@@ -115,21 +114,31 @@ class MetricWriter:
 
     def log(self, payload: dict[str, Any], step: int) -> None:
         payload = {**payload, "step": step, "elapsed_seconds": round(time.monotonic() - self.start, 3)}
-        self.jsonl.write(json.dumps(payload, sort_keys=True) + "\n")
-        self.jsonl.flush()
-        self.writer.writerow({key: payload.get(key, "") for key in self.writer.fieldnames})
-        self.csv_file.flush()
-        for key, value in payload.items():
-            if isinstance(value, (int, float)) and key not in {"step", "epoch"}:
-                self.tensorboard.add_scalar(key, value, step)
-        self.tensorboard.flush()
+        # Open, append and close each time: a handle held open for hours on the JuiceFS home can go bad
+        # (OSError Errno 9), which killed ft16-all-kade-vis-lr2e4 and two earlier runs mid-training.
+        with self.jsonl_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+        with self.csv_path.open("a", newline="", encoding="utf-8") as handle:
+            csv.DictWriter(handle, fieldnames=self.fields, extrasaction="ignore").writerow({key: payload.get(key, "") for key in self.fields})
+        if self.tensorboard:
+            try:
+                for key, value in payload.items():
+                    if isinstance(value, (int, float)) and key not in {"step", "epoch"}:
+                        self.tensorboard.add_scalar(key, value, step)
+                self.tensorboard.flush()
+            except OSError as error:
+                # TensorBoard keeps its own open file; the metrics files above hold the same numbers.
+                print(f"WARNING: TensorBoard logging stopped: {error}", flush=True)
+                self.tensorboard = None
         if self.wandb:
             self.wandb.log(payload, step=step)
 
     def close(self) -> None:
-        self.jsonl.close()
-        self.csv_file.close()
-        self.tensorboard.close()
+        if self.tensorboard:
+            try:
+                self.tensorboard.close()
+            except OSError:
+                pass
         if self.wandb:
             self.wandb.finish()
 

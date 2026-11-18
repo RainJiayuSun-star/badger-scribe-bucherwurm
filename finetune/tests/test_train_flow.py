@@ -154,6 +154,25 @@ class TrainingFlowTests(unittest.TestCase):
         self.assertEqual(self.evals, 2, "epoch 1 was not scored again")
         self.assertEqual((self.run_dir / "best_adapter" / "adapter.txt").read_text(), "1", "worse epoch 2 did not replace it")
 
+    @unittest.skipUnless(importlib.util.find_spec("tensorboard"), "needs tensorboard")
+    def test_metric_writer_appends_per_write_and_survives_a_tensorboard_error(self):
+        from finetune.train import MetricWriter
+
+        self.run_dir.mkdir(parents=True)
+        writer = MetricWriter(self.run_dir, False, {}, None)
+        writer.log({"epoch": 1, "train_loss": 0.5}, 1)
+        writer.tensorboard.add_scalar = mock.Mock(side_effect=OSError(9, "Bad file descriptor"))
+        writer.log({"epoch": 1, "train_loss": 0.4}, 5)    # must not raise
+        self.assertIsNone(writer.tensorboard)
+        writer.log({"epoch": 2, "train_loss": 0.3}, 10)
+        writer.close()
+        MetricWriter(self.run_dir, False, {}, None).log({"epoch": 2, "train_loss": 0.2}, 15)    # a resumed run appends
+        with (self.run_dir / "metrics.csv").open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual([row["step"] for row in rows], ["1", "5", "10", "15"], "one header, every row kept")
+        lines = (self.run_dir / "metrics.jsonl").read_text().splitlines()
+        self.assertEqual([json.loads(line)["train_loss"] for line in lines], [0.5, 0.4, 0.3, 0.2])
+
     def test_all_data_run_keeps_the_last_epoch_without_scoring(self):
         ids = json.loads(self.fold.read_text())
         self.fold.write_text(json.dumps({"name": "all_train", "eval_ids": [], "train_ids": ids["eval_ids"] + ids["train_ids"]}))
