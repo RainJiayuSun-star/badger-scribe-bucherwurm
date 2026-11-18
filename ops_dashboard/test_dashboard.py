@@ -138,5 +138,46 @@ class KaggleTest(unittest.TestCase):
         self.assertEqual(payload['public'], {'submission-04': 0.129})
 
 
+class BadgerBrainTest(unittest.TestCase):
+    def test_key_details_never_reach_the_dashboard(self):
+        import badgerbrain
+        responses = {'/v1/models': (200, {'data': [{'id': 'qwen3.8-27b'}]}),
+                     '/key/info': (200, {'key': 'sk-SECRET', 'info': {'spend': 0.5, 'key_name': 'sk-SECRET', 'token': 'sk-SECRET', 'user_id': 'me'}})}
+        with unittest.mock.patch.object(badgerbrain, 'get', side_effect=lambda path, key: responses[path]):
+            result = badgerbrain.gateway('sk-SECRET')
+        self.assertEqual(result['models'], ['qwen3.8-27b'])
+        self.assertEqual(result['usage']['spend'], 0.5)
+        self.assertNotIn('SECRET', json.dumps(result))
+        self.assertNotIn('user_id', result['usage'])
+
+    def test_unreachable_and_keyless_gateway(self):
+        import badgerbrain
+        with unittest.mock.patch.object(badgerbrain, 'get', return_value=(None, None)):
+            self.assertFalse(badgerbrain.gateway(None)['reachable'])
+        with unittest.mock.patch.object(badgerbrain, 'get', return_value=(401, None)):
+            result = badgerbrain.gateway(None)
+        self.assertTrue(result['reachable'])
+        self.assertIsNone(result['usage'])
+
+    def test_runs_report_progress_and_ignore_other_folders(self):
+        import badgerbrain
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'folds').mkdir()
+            (root / 'folds/a.json').write_text(json.dumps({'eval_ids': ['p1', 'p2', 'p3']}))
+            for name, config in (('screen', {'gateway': 'url', 'model': 'm', 'folds': ['a']}), ('smoke-x', {'gateway': 'url', 'folds': ['a']}), ('ft1', {'lora_rank': 16})):
+                (root / 'finetune' / name).mkdir(parents=True)
+                (root / 'finetune' / name / 'config.json').write_text(json.dumps(config))
+                (root / 'finetune' / name / 'pages.jsonl').write_text(
+                    json.dumps({'page_id': 'p1', 'seconds': 4, 'usage': {'completion_tokens': 10}, 'finish_reason': 'length', 'attempt': 2}) + '\n{partial')
+            updated = (root / 'finetune/screen/pages.jsonl').stat().st_mtime
+            rows = badgerbrain.gateway_runs(root, now=updated + 10)
+            self.assertEqual([r['id'] for r in rows], ['screen'])
+            self.assertEqual((rows[0]['pages'], rows[0]['total'], rows[0]['state'], rows[0]['hit_limit'], rows[0]['retries']), (1, 3, 'running', 1, 1))
+            self.assertEqual(badgerbrain.gateway_runs(root, now=updated + 999)[0]['state'], 'stopped')
+            (root / 'finetune/screen/summary.json').write_text(json.dumps({'cer_by_category': {'survey_notes': 0.2}, 'loop_cuts': 0}))
+            self.assertEqual(badgerbrain.gateway_runs(root, now=updated + 999)[0]['state'], 'complete')
+
+
 if __name__ == '__main__':
     unittest.main()
