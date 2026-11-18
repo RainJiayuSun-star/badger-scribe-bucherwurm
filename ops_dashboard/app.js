@@ -37,6 +37,28 @@ function gpu(g) {
     <div class="hardware">${timer(r&&s.started,'JOB RUNNING')}${timer(r&&r.epoch_started,'EPOCH '+(s.epoch??'—')+' RUNNING')}${timer(g.workspace_started,'WORKSPACE UP')}${timer(g.workspace_started&&new Date(Date.parse(g.workspace_started)+864e5).toISOString(),'UNTIL 24-HOUR STOP','until')}</div>
     <div class="source">CHECKED ${time(g.checked)} · RUN LAST UPDATED ${time(s.updated)}</div>${g.error?'<p class="warn">'+esc(g.error)+'</p>':''}</article>`;
 }
+const CATEGORY={dominy_accounts:'ACCOUNTS',survey_notes:'SURVEY',kade_letters:'GERMAN'};
+function gatewayCard(b) {
+  const usage=b.usage||{}, spend=usage.spend;
+  const label=b.reachable?(b.key_accepted===false?'KEY REJECTED':'ONLINE'):'UNREACHABLE';
+  const note=!b.reachable?'Connect GlobalProtect to reach the gateway.':!b.key_loaded?'Reachable. Start the dashboard with OPENAI_API_KEY set to show models and usage.':b.key_accepted===false?'The gateway rejected this key.':'';
+  return `<article class="gpu"><div class="gpuhead"><span class="unit">GATEWAY / LLM-GW01</span>${badge(b.reachable&&b.key_accepted!==false?'complete':'failed',label)}</div>
+    <div class="runname">${b.models?.length?b.models.map(esc).join(' · '):'Models not available'}</div><div class="gpumeta">${esc(note)}</div>
+    <div class="hardware"><div><b>${b.latency_ms??'—'}</b><small>RESPONSE · MS</small></div><div><b>${b.models?.length||'—'}</b><small>MODELS</small></div><div><b>${spend==null?'—':Number(spend).toFixed(4)}</b><small>METERED SPEND</small></div><div><b>${usage.max_budget??(b.usage?'None':'—')}</b><small>BUDGET LIMIT</small></div></div>
+    <div class="source">CHECKED ${time(b.checked)}${usage.last_active?' · KEY LAST USED '+time(usage.last_active):''}</div></article>`;
+}
+function gatewayRun(r) {
+  const percent=r.total?Math.min(100,100*r.pages/r.total):null, scores=Object.entries(r.cer_by_category||{});
+  const stats=scores.length?scores.map(([c,v])=>`<div><b>${Number(v).toFixed(4)}</b><small>${esc(CATEGORY[c]||c)} CER</small></div>`).join(''):`<div><b>${r.seconds_per_page??'—'}</b><small>SEC / PAGE</small></div><div><b>${Number(r.tokens||0).toLocaleString('en-US')}</b><small>TOKENS OUT</small></div>`;
+  return `<article class="gpu"><div class="gpuhead"><span class="unit">RUN / ${esc(String(r.model||'MODEL').toUpperCase())}</span>${badge(r.state==='stopped'?'unknown':r.state==='complete'?'complete':'active',r.state)}</div>
+    <div class="runname">${esc(r.id)}</div><div class="gpumeta">Held-out training pages</div>
+    <div class="progress"><span style="width:${percent??0}%"></span></div><div class="pair"><span>PAGE ${esc(r.pages)} / ${esc(r.total??'—')}</span><span>${percent===null?'':Math.floor(percent)+'%'}</span></div>
+    <div class="hardware">${stats}</div><div class="hardware"><div><b>${r.loop_cuts??'—'}</b><small>LOOP CUTS</small></div><div><b>${esc(r.hit_limit)}</b><small>HIT TOKEN LIMIT</small></div><div><b>${esc(r.retries)}</b><small>RETRIED</small></div><div><b>${r.wall_seconds==null?'—':duration(r.wall_seconds)}</b><small>WALL TIME</small></div></div>
+    <div class="source">LAST PAGE ${time(r.updated)}</div></article>`;
+}
+function badgerbrainHtml(b) {
+  return b?gatewayCard(b)+(b.runs?.length?b.runs.map(gatewayRun).join(''):'<div class="none">No gateway runs yet.</div>'):'<div class="loading">Checking the gateway…</div>';
+}
 function model(m) {
   const stages=['development','validation','fine-tuning','evaluation','release'];
   return `<article class="model"><div class="modeltitle"><h3>${esc(m.name)}</h3>${badge(m.state,m.state==='active'?m.stage:m.state)}</div><div class="stages">${stages.map(stage=>`<div class="stage ${m.state==='active'&&m.stage.includes(stage)?'current':''}">${esc(stage.toUpperCase())}</div>`).join('')}</div><div class="modelnote">${esc(m.note)}</div><div class="source mono" style="margin-top:12px;color:var(--muted);font-size:10px">${m.completed_runs} COMPLETED RUNS · ${m.queued_runs} QUEUED</div></article>`;
@@ -79,6 +101,7 @@ function render(d) {
   $('waiting').textContent=tasks.filter(t=>['waiting','blocked'].includes(t.display_state)).length;
   $('fresh-agents').textContent=new Set(tasks.filter(t=>t.display_state==='active').map(t=>t.worker)).size;
   $('gpus').innerHTML=d.gpus.length?d.gpus.map(gpu).join(''):'<div class="loading">Connecting to the GPU workspaces…</div>';
+  $('badgerbrain').innerHTML=badgerbrainHtml(d.badgerbrain);
   $('models').innerHTML=d.models.map(model).join('');
   const open = new Set([...document.querySelectorAll('details[open]')].map(x=>x.dataset.worker));
   $('workers').innerHTML=hierarchy(d,tasks);
