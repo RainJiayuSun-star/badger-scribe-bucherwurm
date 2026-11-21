@@ -79,6 +79,13 @@ def gpu_info() -> list[dict[str, Any]]:
     ]
 
 
+def peak_gpu_bytes(torch) -> int:
+    """Peak allocation on CUDA; on a Mac, what the MPS driver holds now (it keeps no peak)."""
+    if torch.cuda.is_available():
+        return torch.cuda.max_memory_allocated()
+    return torch.mps.driver_allocated_memory() if torch.backends.mps.is_available() else 0
+
+
 def training_loss(model, batch: dict[str, Any], config: dict[str, Any]):
     """Token cross-entropy on unmasked labels, with optional label smoothing and loss truncation.
 
@@ -308,8 +315,8 @@ def run(args: argparse.Namespace, holder: dict[str, RunState]) -> int:
         from transformers import get_cosine_schedule_with_warmup
     except ImportError as exc:  # pragma: no cover
         raise SystemExit("Install CUDA fine-tuning dependencies: uv sync --extra cuda --extra finetune") from exc
-    if not torch.cuda.is_available():
-        raise SystemExit("CUDA is required. Run this command on the A5000 host.")
+    if not torch.cuda.is_available() and not torch.backends.mps.is_available():
+        raise SystemExit("A GPU is required: CUDA (EFabric) or an Apple-silicon Mac (MPS).")
     config = load_config(args.config)
     curriculum = resolve_curriculum(config, args.curriculum)
     config["curriculum"] = curriculum["name"]
@@ -465,7 +472,7 @@ def run(args: argparse.Namespace, holder: dict[str, RunState]) -> int:
                         "learning_rate": float(scheduler.get_last_lr()[0]),
                         "gradient_norm": float(grad_norm.item() if hasattr(grad_norm, "item") else grad_norm),
                         "examples_per_second": round(global_step * int(config["effective_batch_size"]) / elapsed, 3),
-                        "peak_gpu_memory_mb": round(torch.cuda.max_memory_allocated() / 1024**2, 2),
+                        "peak_gpu_memory_mb": round(peak_gpu_bytes(torch) / 1024**2, 2),
                     }
                     if writer and (global_step % int(config["logging_steps"]) == 0 or global_step == 1):
                         writer.log(payload, global_step)

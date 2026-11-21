@@ -17,11 +17,21 @@ def load_model_and_processor(config: dict[str, Any], local_rank: int):
 
     # The auto class resolves Qwen2.5-VL (Churro, olmOCR) and Qwen3-VL alike.
     from transformers import AutoModelForImageTextToText as ModelClass
+    if config.get("model_class"):
+        # Kurrent Transcriber 1B declares model_type mistral3, which the auto class maps to Mistral3; that
+        # class names the vision weights differently, so they would load as random values.
+        import transformers
 
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        ModelClass = getattr(transformers, config["model_class"])
+
+    cuda = torch.cuda.is_available()
+    # Apple-silicon GPUs (MPS) run bf16; 4-bit loading needs bitsandbytes and so CUDA.
+    dtype = (torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16) if cuda else torch.bfloat16
     mode = str(config.get("quantization", "4bit")).lower()
     if mode not in {"4bit", "none"}:
         raise ValueError(f"quantization must be '4bit' or 'none', got {mode!r}")
+    if mode == "4bit" and not cuda:
+        raise SystemExit("quantization: 4bit needs an NVIDIA GPU; on a Mac use quantization: none")
     extra = {}
     if mode == "4bit":
         extra["quantization_config"] = BitsAndBytesConfig(
@@ -37,7 +47,7 @@ def load_model_and_processor(config: dict[str, Any], local_rank: int):
         config["model_id"],
         revision=revision,
         dtype=dtype,
-        device_map={"": local_rank},
+        device_map={"": local_rank if cuda else "mps"},
         trust_remote_code=True,
         **extra,
     )

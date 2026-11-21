@@ -101,6 +101,18 @@ class BaseModelOptionTests(unittest.TestCase):
             self.assertRegex(config["model_id"], r"^[\w.-]+/[\w.-]+$", name)
             self.assertRegex(str(config.get("revision")), r"^[0-9a-f]{40}$", name)
 
+    @unittest.skipUnless(importlib.util.find_spec("transformers"), "needs transformers")
+    def test_model_class_overrides_name_real_classes(self):
+        from pathlib import Path
+
+        import transformers
+
+        from finetune.config import load_config
+
+        for path in (Path(__file__).parents[1] / "configs").glob("*.yaml"):
+            if path.name != "curricula.yaml" and load_config(path).get("model_class"):
+                self.assertTrue(hasattr(transformers, load_config(path)["model_class"]), path.name)
+
     def test_committed_configs_use_none_of_these_keys(self):
         from pathlib import Path
 

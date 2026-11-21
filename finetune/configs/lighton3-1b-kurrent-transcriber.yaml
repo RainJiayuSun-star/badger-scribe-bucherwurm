@@ -5,6 +5,8 @@ model_name: lighton3-1b-kurrent-transcriber
 model_id: 13fragments/kurrent-transcriber-1b
 revision: 919390627c7c692ceda7d08d882761e71465fea3
 model_family: lighton
+# Its config says mistral3; this class loads its vision weights under their own names.
+model_class: LightOnOcrForConditionalGeneration
 curriculum: kade
 quantization: none
 prompt: ""

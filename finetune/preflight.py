@@ -87,6 +87,8 @@ def check_gpu(min_free_gib: float, mem_get_info: Callable[[], tuple[int, int]] |
     if mem_get_info is None:
         import torch
 
+        if not torch.cuda.is_available():
+            return []  # an Apple-silicon GPU shares system memory and reports no free figure
         mem_get_info = torch.cuda.mem_get_info
     free, total = mem_get_info()
     if gib(free) < min_free_gib:
