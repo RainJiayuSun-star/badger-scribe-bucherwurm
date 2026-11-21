@@ -28,7 +28,7 @@ from .preflight import run_checks
 from .runstate import Heartbeat, RunState
 from .config import load_config, resolve_curriculum, resolved_config_json
 from .prep import prepare_rows
-from .data import fold_partition, image_path, held_ids, make_partition, read_rows, selected_rows, write_manifest
+from .data import fold_partition, image_path, held_ids, make_partition, read_rows, selected_rows, train_sample, write_manifest
 from .vlm import collate_train, generate_texts, load_model_and_processor
 
 
@@ -111,7 +111,7 @@ class MetricWriter:
             "step", "elapsed_seconds", "epoch", "stage", "train_loss", "learning_rate", "gradient_norm",
             "examples_per_second", "peak_gpu_memory_mb", "val_macro_cer", "val_wer", "val_length_ratio",
             "val_runaway_count", "val_loop_cuts", "val_cer_kade_letters", "val_cer_dominy_accounts", "val_cer_survey_notes",
-            "val_human_macro_cer", "val_human_pages",
+            "val_human_macro_cer", "val_human_pages", "train_macro_cer",
         ]
         if not self.csv_path.exists() or self.csv_path.stat().st_size == 0:
             with self.csv_path.open("a", newline="", encoding="utf-8") as handle:
@@ -268,11 +268,14 @@ def json_cer(value: float) -> float | None:
     return value if math.isfinite(value) else None
 
 
-def stage_rows(partition: dict[str, Any], curriculum: dict[str, Any], human_repeats: int = 1) -> list[list[dict[str, str]]]:
+def stage_rows(partition: dict[str, Any], curriculum: dict[str, Any], human_repeats: int = 1,
+               exclude_sources: tuple[str, ...] = ()) -> list[list[dict[str, str]]]:
     stages = []
     for stage in curriculum["stages"]:
         rows = []
         for row in selected_rows(partition, stage, "train"):
+            if row["label_source"] in exclude_sources:
+                continue
             copies = human_repeats if row["label_source"] == "human" else 1
             # The repeat number gives each copy its own augmentation (see vlm.augmentation_key).
             rows += [row] if copies == 1 else [dict(row, repeat=index) for index in range(copies)]
@@ -349,11 +352,15 @@ def run(args: argparse.Namespace, holder: dict[str, RunState]) -> int:
     else:
         partition = make_partition(rows, held_ids(Path(config["holdout"])), int(config["seed"]))
     # Eval-only runs train nothing, so a fold may have no training pages.
-    stages = [] if args.eval_only else stage_rows(partition, curriculum, int(config["human_repeats"]))
+    stages = [] if args.eval_only else stage_rows(partition, curriculum, int(config["human_repeats"]),
+                                                  tuple(config["exclude_label_sources"]))
     for stage in stages:
         for row in stage:
             row["image_path"] = str(image_path(Path(config["data_root"]), row["page_id"]))
     dev_rows = [dict(row, image_path=str(image_path(Path(config["data_root"]), row["page_id"]))) for row in partition["development"]]
+    # Training pages of the held-out category (all categories in an all-data run), scored without augmentation.
+    train_eval_rows = train_sample([row for stage in stages for row in stage], int(config["train_eval_pages"]),
+                                   int(config["seed"]), {row["category"] for row in dev_rows})
     profile_path = Path(config["augmentation_profile"])
     if curriculum["name"] == "kade-no-augmentation":
         profile_path = profile_path.with_name("none.yaml")
@@ -500,6 +507,16 @@ def run(args: argparse.Namespace, holder: dict[str, RunState]) -> int:
                             state.event("best_adapter_saved", epoch=epoch + 1, cer=best_cer)
                     save_epoch_checkpoint(state, run_dir, global_step, unwrapped, optimizer, scheduler, checkpoint_need, int(config["keep_checkpoints"]),
                                           {"global_step": global_step, "epoch": epoch + 1, "stage": stage_index + 1, "stage_epoch": stage_epoch + 1, "best_cer": json_cer(best_cer)})
+                if accelerator.is_main_process and train_eval_rows:
+                    # shortcut: after the checkpoint, so a kill here loses only this epoch's training-page score; move it before the save if that matters.
+                    state.phase("evaluating", epoch=epoch + 1, step=global_step, eval_pages=len(train_eval_rows), sample="train")
+                    sample = evaluate(accelerator.unwrap_model(model), processor, train_eval_rows, accelerator.device, config,
+                                      run_dir / "train_sample" / f"epoch-{epoch + 1}-preds.csv",
+                                      on_page=lambda done, total: heartbeat(eval_page=done, eval_pages=total))
+                    sample = {"train" + key[3:]: value for key, value in sample.items() if key.startswith("val_")}
+                    state.event("train_evaluated", epoch=epoch + 1, cer=sample["train_macro_cer"])
+                    if writer:
+                        writer.log({**sample, "epoch": epoch + 1, "stage": stage_index + 1}, global_step)
                 accelerator.wait_for_everyone()
                 if global_step >= total_steps:
                     break

@@ -84,6 +84,13 @@ def selected_rows(partition: dict[str, Any], categories: Iterable[str], split: s
     return selected
 
 
+def train_sample(rows: list[dict[str, str]], count: int, seed: int, categories: set[str] | None = None) -> list[dict[str, str]]:
+    """A fixed sample of training pages, the same every epoch and in every run with this seed."""
+    unique = {row["page_id"]: {k: v for k, v in row.items() if k != "repeat"} for row in rows
+              if not categories or row["category"] in categories}
+    return sorted(unique.values(), key=lambda row: rank(seed, row["page_id"]))[:count]
+
+
 def manifest_summary(rows: list[dict[str, str]]) -> dict[str, Any]:
     by_category: dict[str, dict[str, int]] = {}
     for category in CATEGORIES:

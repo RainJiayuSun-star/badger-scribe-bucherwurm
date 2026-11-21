@@ -12,6 +12,10 @@ is scored on the held-out documents.
 Fold files list page IDs only, no label text.
 
     python -m finetune.folds          # writes runs/folds/<fold>.json and prints a summary
+    python -m finetune.folds --data-root ~/badger-scribe-data-1118 --account-docs-from badger-scribe-data/train.csv
+
+--account-docs-from groups only the account books listed in that older train.csv, so the
+groups (and their held-out pages) match earlier runs; newer books are always trained on.
 """
 
 from __future__ import annotations
@@ -46,7 +50,8 @@ def group_documents(page_counts: dict[str, int], groups: int) -> list[list[str]]
     return [sorted(bucket) for bucket in buckets if bucket]
 
 
-def build_folds(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
+def build_folds(rows: list[dict[str, str]], grouped_docs: set[str] | None = None) -> list[dict[str, Any]]:
+    """grouped_docs, if given, limits the grouped categories' held-out documents to these."""
     pages_by_doc: dict[str, list[str]] = defaultdict(list)
     category_of: dict[str, str] = {}
     for row in rows:
@@ -60,7 +65,8 @@ def build_folds(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
     for category in LEAVE_ONE_OUT:
         held_out += [(f"{doc}", category, [doc]) for doc in docs_by_category.get(category, [])]
     for category, groups in GROUPED.items():
-        counts = {doc: len(pages_by_doc[doc]) for doc in docs_by_category.get(category, [])}
+        counts = {doc: len(pages_by_doc[doc]) for doc in docs_by_category.get(category, [])
+                  if grouped_docs is None or doc in grouped_docs}
         for index, docs in enumerate(group_documents(counts, groups), start=1):
             held_out.append((f"{category.split('_')[0]}_group{index}", category, docs))
 
@@ -82,8 +88,8 @@ def build_folds(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
     return folds
 
 
-def check_folds(folds: list[dict[str, Any]], rows: list[dict[str, str]]) -> None:
-    """Fail loudly on leakage or gaps."""
+def check_folds(folds: list[dict[str, Any]], rows: list[dict[str, str]], always_train: set[str] = frozenset()) -> None:
+    """Fail loudly on leakage or gaps. Documents in always_train must never be held out."""
     doc_of = {row["page_id"]: row["doc_id"] for row in rows}
     covered: Counter[str] = Counter()
     for fold in folds:
@@ -94,24 +100,40 @@ def check_folds(folds: list[dict[str, Any]], rows: list[dict[str, str]]) -> None
         if len(fold["eval_ids"]) + len(fold["train_ids"]) != len(rows):
             raise ValueError(f"{fold['name']}: pages missing from the fold")
         covered.update(fold["eval_ids"])
-    unscored = [row["page_id"] for row in rows if covered[row["page_id"]] != 1]
+    leaked = [row["page_id"] for row in rows if row["doc_id"] in always_train and covered[row["page_id"]]]
+    if leaked:
+        raise ValueError(f"{len(leaked)} pages of always-trained documents are held out, e.g. {leaked[:3]}")
+    unscored = [row["page_id"] for row in rows if row["doc_id"] not in always_train and covered[row["page_id"]] != 1]
     if unscored:
         raise ValueError(f"{len(unscored)} pages are not held out exactly once, e.g. {unscored[:3]}")
+
+
+def read_csv(path: Path) -> list[dict[str, str]]:
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        return list(csv.DictReader(handle))
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--data-root", type=Path, default=default_data_root())
     parser.add_argument("--out-dir", type=Path, default=ROOT / "runs" / "folds")
+    parser.add_argument("--account-docs-from", type=Path, help="older train.csv whose account books are the only ones grouped")
     args = parser.parse_args()
-    with (args.data_root / "train.csv").open(newline="", encoding="utf-8-sig") as handle:
-        rows = list(csv.DictReader(handle))
-    folds = build_folds(rows)
-    check_folds(folds, rows)
+    rows = read_csv(args.data_root / "train.csv")
+    grouped_docs = None
+    if args.account_docs_from:
+        grouped_docs = {row["doc_id"] for row in read_csv(args.account_docs_from) if row["category"] in GROUPED}
+    always_train = {row["doc_id"] for row in rows if row["category"] in GROUPED and grouped_docs is not None
+                    and row["doc_id"] not in grouped_docs}
+    folds = build_folds(rows, grouped_docs)
+    check_folds(folds, rows, always_train)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     for fold in folds:
         (args.out_dir / f"{fold['name']}.json").write_text(json.dumps(fold, indent=2) + "\n", encoding="utf-8")
     print(f"wrote {len(folds)} folds to {args.out_dir}")
+    if always_train:
+        pages = sum(row["doc_id"] in always_train for row in rows)
+        print(f"  {len(always_train)} newer account books ({pages} pages) are trained on in every fold")
     for fold in folds:
         flag = "  (noisy: small held-out set)" if fold["noisy"] else ""
         print(f"  {fold['name']:<18} {fold['category']:<16} eval {len(fold['eval_ids']):>3} pages "

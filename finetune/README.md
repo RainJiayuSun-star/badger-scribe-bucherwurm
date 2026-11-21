@@ -73,6 +73,14 @@ accelerate launch --num_processes 1 --mixed_precision no -m finetune.train \
 Each evaluation writes predictions plus a `*-scores.csv` with per-page CER,
 length ratio and whether the loop guard fired, so bad pages are easy to find.
 
+When a newer data release adds account books, keep the old groups so scores stay
+comparable with earlier runs; the new books are then trained on in every fold:
+
+```bash
+python -m finetune.folds --data-root ~/badger-scribe-data-1118 \
+  --account-docs-from badger-scribe-data/train.csv
+```
+
 `best_adapter` is chosen on all held-out pages. English folds are mostly machine
 drafts and hold very few human pages, so `val_human_macro_cer` and
 `val_human_pages` report the human-labeled pages alone, and they should be
@@ -87,6 +95,8 @@ checked too.
 | `use_cleaned_labels` | true | Train on `finetune.prep` targets (envelope Postmark lines removed). Scoring always uses the original key |
 | `mask_illegible` | true | No loss on `#` characters, so the model never learns to emit them |
 | `human_repeats` | 1 | Repeat each human-labeled training page this many times per epoch (training only) |
+| `exclude_label_sources` | `[]` | Leave out training pages with these `label_source` values, e.g. `[silver_claude-opus]` (training only) |
+| `train_eval_pages` | 0 | After every epoch, also score this many fixed training pages of the held-out category, without augmentation (`train_macro_cer`) |
 | `loop_guard` | true | Stop decoding at a repetition loop and keep its first copy (`finetune/loopguard.py`) |
 | `loop_retry_temperatures` | `[]` | If set, re-decode looping or near-empty pages with sampling at these temperatures |
 | `keep_checkpoints` | 2 | FIFO: after a new resume checkpoint is complete, delete the oldest beyond N (0 keeps all) |
@@ -94,6 +104,28 @@ checked too.
 
 No option reads `label_source` at inference time; the competition forbids
 behaving differently on silver-labelled pages.
+
+## Overfitting tests
+
+`finetune/overfit.py` runs the routine check: 6 epochs instead of 3, scoring 12
+fixed training pages after every epoch next to the held-out pages. Training CER
+that keeps falling while held-out CER rises is overfitting; held-out CER that
+jumps around while training CER does not fall is instability. The report also
+averages the held-out curves over the folds and picks the fewest epochs within
+0.005 (the measured run-to-run noise) of the best mean, which is the epoch count
+to use for all-data runs.
+
+```bash
+python -m finetune.overfit config finetune/configs/olmocr2-7b-bf16-english.yaml runs/pm/configs/of1-olmocr-trunc.yaml \
+  --set loss_truncation=0.05 --set data_root=/home/igloege/badger-scribe-data-1118
+python -m finetune.overfit queue of1-olmocr-trunc runs/pm/configs/of1-olmocr-trunc.yaml badger-scribe-run-o \
+  dominy_group1 dominy_group2 dominy_group3 >> ~/badger-scribe-bucherwurm/runs/pm/queue-gpu1.txt
+python -m finetune.overfit report runs/finetune/of1-olmocr-trunc-*
+```
+
+Run it on three folds of each category whenever a category's base model, data or
+training settings change. Training-page predictions go to `train_sample/`; they
+are training pages, never test pages.
 
 ## Checkpoints and run diagnostics
 

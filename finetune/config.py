@@ -69,6 +69,11 @@ def load_config(path: Path) -> dict[str, Any]:
     # train pages are mostly unreviewed drafts, so this tilts training toward the
     # reviewed ones. Training only; inference never sees label_source.
     config.setdefault("human_repeats", 1)
+    # Training pages whose label_source is listed here are left out (training only).
+    config.setdefault("exclude_label_sources", [])
+    # Score this many fixed training pages after every epoch, next to the held-out
+    # pages, to see overfitting (finetune/overfit.py). 0 turns it off.
+    config.setdefault("train_eval_pages", 0)
     # Resume checkpoints hold only what training changes (about 0.4 GB for
     # Churro-3B at rank 16; see finetune/checkpoints.py), so by default they sit
     # in the run directory on persistent storage. keep_checkpoints is a FIFO:

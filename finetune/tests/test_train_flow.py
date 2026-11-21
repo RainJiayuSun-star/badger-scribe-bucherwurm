@@ -135,6 +135,18 @@ class TrainingFlowTests(unittest.TestCase):
                 self._train(*extra)
         self.assertEqual((self.run_dir / "best_adapter" / "adapter.txt").read_text(), "1")
 
+    def test_training_sample_is_scored_every_epoch_and_never_picks_the_best_adapter(self):
+        self.config.write_text(self.config.read_text() + "train_eval_pages: 2\n")
+        self.cers = [0.2, 0.1, 0.3, 0.05]  # held-out, then training sample, each epoch
+        self.assertEqual(self._train(), 0)
+        scored = [(e["epoch"], e["cer"]) for e in self._events() if e["event"] == "train_evaluated"]
+        self.assertEqual(scored, [(1, 0.1), (2, 0.05)])
+        self.assertEqual((self.run_dir / "best_adapter" / "adapter.txt").read_text(), "1", "only held-out CER picks the adapter")
+        with (self.run_dir / "train_sample" / "epoch-2-preds.csv").open(encoding="utf-8") as handle:
+            pages = [row["page_id"] for row in csv.DictReader(handle)]
+        self.assertEqual(len(pages), 2)
+        self.assertTrue(all(page.startswith("kade_002") for page in pages), "training pages only")
+
     def test_a_shutdown_is_not_a_crash_and_resume_finishes_the_run(self):
         from finetune.status import verdict
 
