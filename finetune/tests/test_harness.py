@@ -22,6 +22,10 @@ class ImageBudgetTests(unittest.TestCase):
     def test_no_cap_leaves_the_item_unchanged(self):
         self.assertNotIn("max_pixels", messages("page.jpg")[0]["content"][0])
 
+    def test_empty_prompt_sends_the_image_alone(self):
+        content = messages("page.jpg", None, None, {"prompt": ""})[0]["content"]
+        self.assertEqual([item["type"] for item in content], ["image"])
+
     def test_target_goes_in_the_assistant_turn(self):
         self.assertEqual(messages("page.jpg", "hello")[1]["content"][0]["text"], "hello")
 

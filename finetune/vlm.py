@@ -106,7 +106,9 @@ def messages(image: str | Path | Image.Image, text: str | None = None, max_pixel
     image_item: dict[str, Any] = {"type": "image", "image": image_value}
     if max_pixels:
         image_item["max_pixels"] = int(max_pixels)
-    content: list[dict[str, Any]] = [image_item, {"type": "text", "text": config.get("prompt", PROMPT)}]
+    prompt = config.get("prompt", PROMPT)
+    # An empty prompt sends the image alone, as Kurrent Transcriber 1B was trained.
+    content: list[dict[str, Any]] = [image_item] + ([{"type": "text", "text": prompt}] if prompt else [])
     if config.get("prompt_first"):
         content.reverse()
     result = [{"role": "user", "content": content}]

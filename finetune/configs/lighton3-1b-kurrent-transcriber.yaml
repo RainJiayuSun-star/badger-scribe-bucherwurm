@@ -1,0 +1,24 @@
+# Kurrent Transcriber 1B (13fragments): a merge of two LightOnOCR-3-1B fine-tunes for German Kurrent and Sütterlin.
+# Weights CC BY-SA 4.0 (not OSI): confirm with the organizers before it goes into a final submission.
+# The card runs it on the page image alone, longest edge 1540 px, greedy, up to 4,096 new tokens.
+model_name: lighton3-1b-kurrent-transcriber
+model_id: 13fragments/kurrent-transcriber-1b
+revision: 919390627c7c692ceda7d08d882761e71465fea3
+model_family: lighton
+curriculum: kade
+quantization: none
+prompt: ""
+image_longest_edge: 1540
+target_logits_only: true
+min_free_gpu_gib: 8.0
+max_seq_length: 8192
+epochs: 3
+per_device_batch_size: 1
+effective_batch_size: 8
+learning_rate: 0.0002
+vision_learning_rate: 0.00002
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+adapter_policy: language_projector
+eval_max_new_tokens: 4096
