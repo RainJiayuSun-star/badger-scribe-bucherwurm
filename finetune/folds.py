@@ -14,8 +14,9 @@ Fold files list page IDs only, no label text.
     python -m finetune.folds          # writes runs/folds/<fold>.json and prints a summary
     python -m finetune.folds --data-root ~/badger-scribe-data-1118 --account-docs-from badger-scribe-data/train.csv
 
---account-docs-from groups only the account books listed in that older train.csv, so the
-groups (and their held-out pages) match earlier runs; newer books are always trained on.
+--account-docs-from groups the account books listed in that older train.csv exactly as that
+release did, so held-out pages match earlier runs. Newer books are always trained on, and a
+book that has since moved to test.csv drops out of its group.
 """
 
 from __future__ import annotations
@@ -50,8 +51,8 @@ def group_documents(page_counts: dict[str, int], groups: int) -> list[list[str]]
     return [sorted(bucket) for bucket in buckets if bucket]
 
 
-def build_folds(rows: list[dict[str, str]], grouped_docs: set[str] | None = None) -> list[dict[str, Any]]:
-    """grouped_docs, if given, limits the grouped categories' held-out documents to these."""
+def build_folds(rows: list[dict[str, str]], group_counts: dict[str, int] | None = None) -> list[dict[str, Any]]:
+    """group_counts, if given, are the page counts (from an older release) that the account groups are built from."""
     pages_by_doc: dict[str, list[str]] = defaultdict(list)
     category_of: dict[str, str] = {}
     for row in rows:
@@ -65,10 +66,11 @@ def build_folds(rows: list[dict[str, str]], grouped_docs: set[str] | None = None
     for category in LEAVE_ONE_OUT:
         held_out += [(f"{doc}", category, [doc]) for doc in docs_by_category.get(category, [])]
     for category, groups in GROUPED.items():
-        counts = {doc: len(pages_by_doc[doc]) for doc in docs_by_category.get(category, [])
-                  if grouped_docs is None or doc in grouped_docs}
+        counts = group_counts if group_counts is not None else {doc: len(pages_by_doc[doc]) for doc in docs_by_category.get(category, [])}
         for index, docs in enumerate(group_documents(counts, groups), start=1):
-            held_out.append((f"{category.split('_')[0]}_group{index}", category, docs))
+            docs = [doc for doc in docs if doc in pages_by_doc]  # a book moved to test since that release
+            if docs:
+                held_out.append((f"{category.split('_')[0]}_group{index}", category, docs))
 
     folds = []
     for name, category, docs in held_out:
@@ -120,12 +122,12 @@ def main() -> int:
     parser.add_argument("--account-docs-from", type=Path, help="older train.csv whose account books are the only ones grouped")
     args = parser.parse_args()
     rows = read_csv(args.data_root / "train.csv")
-    grouped_docs = None
+    group_counts = None
     if args.account_docs_from:
-        grouped_docs = {row["doc_id"] for row in read_csv(args.account_docs_from) if row["category"] in GROUPED}
-    always_train = {row["doc_id"] for row in rows if row["category"] in GROUPED and grouped_docs is not None
-                    and row["doc_id"] not in grouped_docs}
-    folds = build_folds(rows, grouped_docs)
+        group_counts = Counter(row["doc_id"] for row in read_csv(args.account_docs_from) if row["category"] in GROUPED)
+    always_train = {row["doc_id"] for row in rows if row["category"] in GROUPED and group_counts is not None
+                    and row["doc_id"] not in group_counts}
+    folds = build_folds(rows, group_counts)
     check_folds(folds, rows, always_train)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     for fold in folds:

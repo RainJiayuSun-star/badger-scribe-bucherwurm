@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from collections import Counter
 from pathlib import Path
 
 from finetune import overfit
@@ -17,10 +18,17 @@ class AccountDocsFromTests(unittest.TestCase):
         old_rows = rows_for(SPEC)
         new_rows = old_rows + rows_for({"dominy_100": ("dominy_accounts", 40), "dominy_101": ("dominy_accounts", 3)})
         old = {f["name"]: f for f in build_folds(old_rows)}
-        grouped = {r["doc_id"] for r in old_rows if r["category"] == "dominy_accounts"}
-        new = {f["name"]: f for f in build_folds(new_rows, grouped)}
+        counts = Counter(r["doc_id"] for r in old_rows if r["category"] == "dominy_accounts")
+        new = {f["name"]: f for f in build_folds(new_rows, counts)}
         for name, fold in old.items():
             self.assertEqual(new[name]["eval_ids"], fold["eval_ids"], name)
+        # A book moved to test leaves its group; the other groups keep their exact membership.
+        moved = old["dominy_group1"]["eval_docs"][0]
+        shrunk = {f["name"]: f for f in build_folds([r for r in new_rows if r["doc_id"] != moved], counts)}
+        self.assertNotIn(moved, shrunk["dominy_group1"]["eval_docs"])
+        for name in old:
+            if name != "dominy_group1":
+                self.assertEqual(shrunk[name]["eval_ids"], old[name]["eval_ids"], name)
         always = {"dominy_100", "dominy_101"}
         check_folds(list(new.values()), new_rows, always)
         self.assertTrue(all(any(p.startswith("dominy_100") for p in f["train_ids"]) for f in new.values()))
