@@ -11,7 +11,8 @@ import sys
 CONFIG_KEYS = ('model_id', 'revision', 'adapter_policy', 'lora_rank', 'lora_alpha', 'learning_rate',
                'vision_learning_rate', 'epochs', 'effective_batch_size', 'seed', 'human_repeats',
                'category_repeats', 'curriculum', 'augmentation_profile', 'max_pixels', 'max_pixels_by_category',
-               'repetition_penalty', 'loop_retry_temperatures', 'quantization', 'dtype')
+               'repetition_penalty', 'loop_retry_temperatures', 'quantization', 'dtype', 'train_eval_pages',
+               'exclude_label_sources', 'loss_truncation', 'label_smoothing')
 SUMMARY_KEYS = ('cer', 'cer_by_category', 'loop_cuts', 'pages', 'peak_gpu_gib', 'wall_seconds', 'model_id',
                 'revision', 'git_version', 'gpu')
 KEY = re.compile(r'[\w.-]{1,80}')
@@ -68,6 +69,12 @@ def collect_run(folder):
     run['epochs'] = [{k: v for k, v in row.items() if isinstance(v, (int, float)) and
                       (k in ('epoch', 'elapsed_seconds', 'peak_gpu_memory_mb') or k.startswith('val_'))}
                      for row in metric_rows if 'val_macro_cer' in row]
+    # Overfitting tests log a training-page CER per epoch on its own row; attach it to that epoch.
+    train = {row['epoch']: row['train_macro_cer'] for row in metric_rows
+             if isinstance(row.get('epoch'), int) and isinstance(row.get('train_macro_cer'), (int, float))}
+    for row in run['epochs']:
+        if row.get('epoch') in train:
+            row['train_macro_cer'] = train[row['epoch']]
     run['loss'] = [[row['step'], row['epoch'], round(row['train_loss'], 5)] for row in metric_rows
                    if all(isinstance(row.get(k), (int, float)) for k in ('step', 'epoch', 'train_loss'))]
     events = lines(folder / 'events.jsonl')

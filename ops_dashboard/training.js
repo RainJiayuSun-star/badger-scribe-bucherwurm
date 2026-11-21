@@ -150,11 +150,26 @@ function latestHtml() {
     <div class="charts">${lineChart('latestloss', {title: `Training loss, ${latest.id}'s adapters`, cap: 'All-data runs, so no held-out test curve. The public CER on the right is their test.', series, xTitle: 'Epoch', digits: 3})}${bars}</div>`;
 }
 
+const TRAIN_COLOR = '#efac51';
+function overfitHtml() {
+  const tests = training.overfit || [];
+  if (!tests.length) return '<div class="none">No overfitting tests have reported yet. Runs with train_eval_pages set appear here once their first epoch is scored.</div>';
+  const f = v => v == null ? '&mdash;' : Number(v).toFixed(4);
+  return tests.map((t, i) => {
+    const series = [{name: 'Held-out CER (mean)', color: ONE, pts: t.held_mean}, {name: 'Training-page CER (mean)', color: TRAIN_COLOR, pts: t.train_mean}].filter(s => s.pts.length);
+    const rows = t.runs.map(r => `<tr><td class="id">${esc(r.fold || r.id)}</td><td class="mono">${esc(r.best_epoch ?? '—')}</td><td class="mono">${f(r.last_held)}</td><td class="mono">${f(r.last_train)}</td><td class="mono">${r.last_held != null && r.last_train != null ? (r.last_held - r.last_train >= 0 ? '+' : '') + (r.last_held - r.last_train).toFixed(4) : '&mdash;'}</td><td>${esc(r.verdict)}</td></tr>`).join('');
+    return `<div class="chart" style="margin-bottom:16px"><h3>${esc(t.name)} · ${esc(t.model)}</h3><p class="cap">${t.runs.length} fold run${t.runs.length > 1 ? 's' : ''} · epochs to use: <b>${esc(t.epochs_to_use ?? '—')}</b></p>
+      <div class="charts">${lineChart('overfit' + i, {title: 'Mean CER by epoch', cap: 'Over the epochs every fold run has reached.', series, xTitle: 'Epoch', digits: 4, markers: true})}
+      <div class="tablewrap"><table><thead><tr><th>Fold</th><th>Best epoch</th><th>Held-out, latest</th><th>Training, latest</th><th>Gap</th><th>Verdict</th></tr></thead><tbody>${rows}</tbody></table></div></div></div>`;
+  }).join('');
+}
+
 function runHtml(id) {
   const run = training.runs.find(r => r.id === id);
   if (!run) return '';
   const loss = run.loss.length ? [{name: 'Training loss', color: ONE, pts: lossPoints(run)}] : [];
   const val = run.val.length ? [{name: 'Held-out CER', color: ONE, pts: run.val.map(([e, c]) => [e, c])}] : [];
+  if (run.train?.length) val.push({name: 'Training-page CER', color: TRAIN_COLOR, pts: run.train});
   const valCap = run.val.length ? `CER on ${run.fold || 'the held-out pages'} at the end of each epoch.` : run.fold === 'all_train' ? 'Trained on all 619 training pages, so nothing is held out.' : 'No held-out scores logged.';
   return `<div class="charts">${lineChart('runloss', {title: `Training loss · ${run.model}`, cap: `${run.id}${run.fold ? ', fold ' + run.fold : ''}`, series: loss, xTitle: 'Epoch', digits: 3})}${lineChart('runval', {title: 'Held-out CER by epoch', cap: valCap, series: val, xTitle: 'Epoch', digits: 4, markers: true})}</div>`;
 }
@@ -163,6 +178,7 @@ function drawTraining() {
   if (!training) return;
   $('collections').innerHTML = $('collections2').innerHTML = collectionsHtml();
   $('latest').innerHTML = latestHtml();
+  $('overfit').innerHTML = overfitHtml();
   const pick = $('trainrun'), keep = pick.value;
   const runs = training.runs.filter(r => !r.id.startsWith('submission-') && (r.loss.length || r.val.length))
     .sort((a, b) => (b.started || '').localeCompare(a.started || ''));

@@ -51,6 +51,17 @@ class HistoryTests(unittest.TestCase):
             record = describe(collect(root)[0], {})
             self.assertEqual((record['outcome'], record['error'], record['best']), ('failed', 'OSError', 0.08))
 
+    def test_training_page_cer_joins_its_epoch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            self.run_folder(root, 'of1-olmocr-dominy_group1', {'fold': 'dominy_group1.json', 'train_eval_pages': 12,
+                                                                'exclude_label_sources': ['silver_claude-opus']},
+                            metrics=[{'epoch': 1, 'val_macro_cer': 0.30}, {'epoch': 1, 'train_macro_cer': 0.20},
+                                     {'epoch': 2, 'val_macro_cer': 0.28}, {'epoch': 2, 'train_macro_cer': 0.10}])
+            run = collect(root)[0]
+            self.assertEqual([(e['epoch'], e['val_macro_cer'], e['train_macro_cer']) for e in run['epochs']], [(1, 0.30, 0.20), (2, 0.28, 0.10)])
+            self.assertEqual(run['config']['exclude_label_sources'], ['silver_claude-opus'])
+
 
 if __name__ == '__main__':
     unittest.main()

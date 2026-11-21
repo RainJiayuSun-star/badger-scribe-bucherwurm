@@ -61,9 +61,13 @@ after the workspaces stop. Use `--offline` to skip EFabric and `--no-open` to sk
 - Agents: your coordinator and workers, by role. Agents report through `telemetry.py`;
   give every agent `WORKER_REPORTING.md`. A task counts as active only if it was
   reported in the last 5 minutes.
-- Runs: the jobs in your current queues.
+- Runs: the jobs in your current queues. Each GPU card also lists runs started on that
+  workspace without a queue line, for a day after their last update.
 - Training: training-loss curves of the latest submission's adapters, public CER by
-  submission, and for any fine-tuning run its loss and held-out CER by epoch.
+  submission, and for any fine-tuning run its loss and held-out CER by epoch. Overfitting
+  tests (runs with `train_eval_pages` set, see `finetune/overfit.py`) are grouped by test,
+  with mean training-page and held-out CER by epoch, a verdict per fold and the epoch count
+  to use for all-data runs.
 
 ## Tests
 

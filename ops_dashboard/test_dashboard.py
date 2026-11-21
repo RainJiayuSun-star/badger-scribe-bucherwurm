@@ -3,10 +3,11 @@ import json
 import tempfile
 import unittest
 import unittest.mock
+from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from telemetry import report, snapshot
-from live_state import enrich, run_state
+from live_state import enrich, model_for, run_state
 
 spec = importlib.util.spec_from_file_location('collector', Path(__file__).with_name('collect_remote.py'))
 collector = importlib.util.module_from_spec(spec)
@@ -31,6 +32,37 @@ class CollectorTest(unittest.TestCase):
             self.assertEqual(rows[1]['status'], {})
             self.assertIsNone(rows[1]['rc'])
             self.assertNotIn('DO NOT EXPORT', json.dumps(rows))
+
+
+    def test_recent_off_queue_runs_on_this_host_are_listed(self):
+        now = collector.datetime.now(collector.timezone.utc)
+        recent, old = now.isoformat(), (now - timedelta(days=2)).isoformat()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'pm').mkdir()
+            (root / 'pm/queue-gpu1.txt').write_text('queued-one 10 command\n')
+            (root / 'pm/queue-gpu2.txt').write_text('other-queue 10 command\n')
+            runs = {'ft40-q38-live': ('this-host', recent), 'ft40-q38-old': ('this-host', old), 'ft40-q38-elsewhere': ('other-host', recent),
+                    'queued-one': ('this-host', recent), 'other-queue': ('this-host', recent)}
+            for run, (host, updated) in runs.items():
+                (root / 'finetune' / run).mkdir(parents=True)
+                (root / 'finetune' / run / 'status.json').write_text(json.dumps({'phase': 'training', 'host': host, 'updated': updated, 'text': 'DO NOT EXPORT'}))
+            (root / 'finetune/ft40-q38-partial').mkdir()
+            (root / 'finetune/ft40-q38-partial/status.json').write_text('{partial')
+            with unittest.mock.patch.object(collector.socket, 'gethostname', return_value='this-host'):
+                rows = collector.collect(root, 'gpu1')
+            self.assertEqual([r['id'] for r in rows], ['ft40-q38-live', 'queued-one'])
+            self.assertNotIn('DO NOT EXPORT', json.dumps(rows))
+
+
+    def test_ram_leaves_out_file_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            (folder / 'memory.stat').write_text('anon 100\nfile 900\nshmem 20\n')
+            (folder / 'memory.max').write_text('2000\n')
+            self.assertEqual(collector.ram(folder), {'used': 120, 'total': 2000})
+            (folder / 'memory.max').write_text('max\n')
+            self.assertIsNone(collector.ram(folder))
 
 
 class TaskEventsTest(unittest.TestCase):
@@ -60,6 +92,10 @@ class TaskEventsTest(unittest.TestCase):
 
 
 class DerivedStateTest(unittest.TestCase):
+    def test_qwen_runs_get_their_own_model(self):
+        self.assertEqual(model_for('ft40-q38-survey_011'), 'qwen38')
+        self.assertEqual(model_for('ft22-olmocr-smooth-dominy_group4'), 'olmocr')
+
     def test_offline_run_is_unknown_not_running(self):
         self.assertEqual(run_state({'rc': None, 'status': {'phase': 'training'}}, True), 'unknown')
         self.assertEqual(run_state({'rc': None, 'status': {'phase': 'training'}, 'process_alive': False}), 'unknown')
@@ -136,6 +172,22 @@ class KaggleTest(unittest.TestCase):
         self.assertEqual(rows['ft6-g1']['category'], 'dominy_accounts')
         self.assertEqual(rows['ft6-g1']['val'], [[1, 0.33]], 'an epoch with no score is dropped')
         self.assertEqual(payload['public'], {'submission-04': 0.129})
+        self.assertEqual(payload['overfit'], [], 'no run logged training-page CER')
+
+    def test_overfitting_tests_get_a_verdict_and_an_epoch_count(self):
+        import overfit
+        def row(fold, held, train):
+            return {'id': f'of1-olmocr-{fold}', 'fold': fold, 'model': 'olmOCR-2-7B',
+                    'val': [[e, c] for e, c in enumerate(held, 1)], 'train': [[e, c] for e, c in enumerate(train, 1)]}
+        tests = overfit.summarize([row('dominy_group1', [0.30, 0.25, 0.248, 0.27], [0.2, 0.1, 0.05, 0.03]),
+                                   row('dominy_group2', [0.20, 0.17, 0.168, 0.18], [0.2, 0.1, 0.05, 0.03]),
+                                   {'id': 'ft6-g1', 'fold': 'dominy_group1', 'model': 'x', 'val': [[1, 0.3]], 'train': []}])
+        self.assertEqual(len(tests), 1, 'only runs with training-page CER are tests')
+        test = tests[0]
+        self.assertEqual((test['name'], test['epochs_to_use'], len(test['runs'])), ('of1-olmocr', 2, 2))
+        self.assertTrue(test['runs'][0]['verdict'].startswith('overfitting after epoch 3'))
+        self.assertTrue(overfit.verdict({1: 0.2, 2: 0.35, 3: 0.3}, {1: 0.1, 2: 0.2, 3: 0.15}).startswith('unstable'))
+        self.assertTrue(overfit.verdict({1: 0.3, 2: 0.25, 3: 0.252}, {1: 0.2, 2: 0.1, 3: 0.05}).startswith('no overfitting'))
 
 
 class BadgerBrainTest(unittest.TestCase):

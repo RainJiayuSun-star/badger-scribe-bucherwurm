@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 
 RUN = re.compile(r'[A-Za-z0-9_.-]+')
 ESTIMATES = {}  # planned minutes per job from <runs>/pm/estimates.json, if that file exists; loaded in main
+OFF_QUEUE_SECONDS = 86400  # how long a run started outside the queue files stays listed after its last update
 
 
 def adapter_run(path):
@@ -65,6 +66,66 @@ def submissions(root):
     return rows
 
 
+def run_item(root, run, rc=None, line=''):
+    """One run's allowlisted status, scores and liveness."""
+    folder = root / 'finetune' / run
+    try:
+        status = json.loads((folder / 'status.json').read_text())
+    except (OSError, ValueError):
+        status = {}
+    item = {'id': run, 'rc': rc, 'status': {k: status[k] for k in
+            ('phase', 'epoch', 'step', 'total_steps', 'eval_page', 'eval_pages', 'updated', 'started', 'phase_started') if k in status}, 'scores': []}
+    if isinstance(ESTIMATES.get(run), (int, float)):
+        item['planned_minutes'] = ESTIMATES[run]
+    if run.startswith('submission-'):  # its fine-tunes, from the --adapter arguments on its queue line
+        item['training'] = training_for(root, [adapter_run(a.split('=', 1)[1]) for a in re.findall(r'--adapter (\S+=\S+)', line)])
+    item['process_alive'] = None
+    if status.get('host') == socket.gethostname() and isinstance(status.get('pid'), int):
+        try:
+            os.kill(status['pid'], 0)
+            item['process_alive'] = True
+        except ProcessLookupError:
+            item['process_alive'] = False
+        except PermissionError:
+            pass
+    events = folder / 'events.jsonl'
+    for event in events.read_text().splitlines() if events.exists() else []:
+        try:
+            e = json.loads(event)
+            if e.get('event') == 'evaluated' and isinstance(e.get('cer'), (float, int)):
+                item['scores'].append({'epoch': e.get('epoch'), 'cer': e['cer']})
+            # the first event of the current epoch marks when that epoch started
+            if 'epoch_started' not in item and e.get('epoch') is not None and e.get('epoch') == status.get('epoch') \
+                    and isinstance(e.get('time'), str):
+                item['epoch_started'] = e['time']
+        except ValueError:
+            pass
+    return item
+
+
+def queued_ids(root):
+    """Every run named in any GPU queue file."""
+    return {line.split()[0] for path in (root / 'pm').glob('queue-*.txt') for line in path.read_text().splitlines()
+            if line.strip() and not line.startswith('#')}
+
+
+def off_queue_runs(root):
+    """Runs started on this workspace without a queue line, such as the Qwen fold workers."""
+    listed, now, rows = queued_ids(root), datetime.now(timezone.utc).timestamp(), []
+    for path in sorted((root / 'finetune').glob('*/status.json')):
+        run = path.parent.name
+        if run in listed or not re.fullmatch(r'[A-Za-z0-9_-]+', run):
+            continue
+        try:
+            status = json.loads(path.read_text())
+            updated = datetime.fromisoformat(status['updated']).timestamp()
+        except (OSError, ValueError, KeyError, TypeError):
+            continue  # a run mid-write is picked up on the next poll
+        if status.get('host') == socket.gethostname() and now - updated < OFF_QUEUE_SECONDS:
+            rows.append(run_item(root, run))
+    return rows
+
+
 def collect(root, queue):
     done = {}
     path = root / 'pm' / ('queue-' + queue + '.txt.done')
@@ -72,47 +133,23 @@ def collect(root, queue):
         match = re.match(r'^(\S+) rc=(-?\d+)', line)
         if match:
             done[match[1]] = int(match[2])
-    rows = []
+    rows = off_queue_runs(root)  # first, because the GPU card shows the first live run it finds
     for line in (root / 'pm' / ('queue-' + queue + '.txt')).read_text().splitlines():
         if not line.strip() or line.startswith('#'):
             continue
         run = line.split()[0]
-        if not re.fullmatch(r'[A-Za-z0-9_-]+', run):
-            continue
-        folder = root / 'finetune' / run
-        try:
-            status = json.loads((folder / 'status.json').read_text())
-        except (OSError, ValueError):
-            status = {}
-        item = {'id': run, 'rc': done.get(run), 'status': {k: status[k] for k in
-                ('phase', 'epoch', 'step', 'total_steps', 'eval_page', 'eval_pages', 'updated', 'started', 'phase_started') if k in status}, 'scores': []}
-        if isinstance(ESTIMATES.get(run), (int, float)):
-            item['planned_minutes'] = ESTIMATES[run]
-        if run.startswith('submission-'):  # its fine-tunes, from the --adapter arguments on its queue line
-            item['training'] = training_for(root, [adapter_run(a.split('=', 1)[1]) for a in re.findall(r'--adapter (\S+=\S+)', line)])
-        item['process_alive'] = None
-        if status.get('host') == socket.gethostname() and isinstance(status.get('pid'), int):
-            try:
-                os.kill(status['pid'], 0)
-                item['process_alive'] = True
-            except ProcessLookupError:
-                item['process_alive'] = False
-            except PermissionError:
-                pass
-        events = folder / 'events.jsonl'
-        for event in events.read_text().splitlines() if events.exists() else []:
-            try:
-                e = json.loads(event)
-                if e.get('event') == 'evaluated' and isinstance(e.get('cer'), (float, int)):
-                    item['scores'].append({'epoch': e.get('epoch'), 'cer': e['cer']})
-                # the first event of the current epoch marks when that epoch started
-                if 'epoch_started' not in item and e.get('epoch') is not None and e.get('epoch') == status.get('epoch') \
-                        and isinstance(e.get('time'), str):
-                    item['epoch_started'] = e['time']
-            except ValueError:
-                pass
-        rows.append(item)
+        if re.fullmatch(r'[A-Za-z0-9_-]+', run):
+            rows.append(run_item(root, run, done.get(run), line))
     return rows
+
+
+def ram(folder=pathlib.Path('/sys/fs/cgroup')):
+    """Workspace RAM in bytes. Used leaves out file cache, which the kernel frees when programs need it."""
+    try:
+        stat = dict(line.split() for line in (folder / 'memory.stat').read_text().splitlines())
+        return {'used': int(stat['anon']) + int(stat['shmem']), 'total': int((folder / 'memory.max').read_text())}
+    except (OSError, ValueError, KeyError):  # memory.max reads "max" when the workspace has no limit
+        return None
 
 
 if __name__ == '__main__':
@@ -128,5 +165,5 @@ if __name__ == '__main__':
     started = subprocess.check_output(['ps', '-o', 'lstart=', '-p', '1'], text=True, env={**os.environ, 'TZ': 'UTC'}).strip()
     print(json.dumps({'queue': queue, 'checked': datetime.now(timezone.utc).isoformat(),
                       'workspace_started': datetime.strptime(started, '%a %b %d %H:%M:%S %Y').replace(tzinfo=timezone.utc).isoformat(),
-                      'gpu': {'name': gpu[0].strip(), 'used': int(gpu[1]), 'total': int(gpu[2]), 'utilization': int(gpu[3])},
+                      'gpu': {'name': gpu[0].strip(), 'used': int(gpu[1]), 'total': int(gpu[2]), 'utilization': int(gpu[3])}, 'ram': ram(),
                       'runs': collect(root, queue), 'submissions': submissions(root)}))

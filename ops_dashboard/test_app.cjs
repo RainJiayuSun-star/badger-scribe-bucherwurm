@@ -6,7 +6,7 @@ function element(id) {
   if (!elements.has(id)) elements.set(id, {textContent:'', innerHTML:'', value:id==='filter'?'all':'', classList:{add(){},remove(){},toggle(){}}});
   return elements.get(id);
 }
-const context = vm.createContext({document:{getElementById:element,querySelectorAll:()=>[]},
+const context = vm.createContext({document:{getElementById:element,querySelectorAll:()=>[],addEventListener(){}},
   setInterval(){},fetch:async()=>({ok:false}),Date,Set,Math,console});
 vm.runInContext(fs.readFileSync(__dirname+'/app.js','utf8'),context);
 const fixture = {
@@ -34,4 +34,14 @@ assert.match(element('badgerbrain').innerHTML,/Connect GlobalProtect/);
 element('filter').value='complete';
 vm.runInContext('drawRuns()',context);
 assert.equal(element('runs').innerHTML,'');
+vm.runInContext(fs.readFileSync(__dirname+'/training.js','utf8'),context);
+vm.runInContext(`training={runs:[],public:{},overfit:[{name:'of1-<i>x</i>',model:'olmOCR-2-7B',epochs_to_use:2,
+  held_mean:[[1,.3],[2,.25]],train_mean:[[1,.2],[2,.1]],
+  runs:[{id:'of1-x-dominy_group1',fold:'dominy_group1',best_epoch:2,last_held:.25,last_train:.1,verdict:'no overfitting seen (best epoch 2)'}]}]}`,context);
+const overfitHtml=vm.runInContext('overfitHtml()',context);
+assert.match(overfitHtml,/epochs to use: <b>2<\/b>/);
+assert.match(overfitHtml,/\+0\.1500/);
+assert.match(overfitHtml,/Training-page CER \(mean\)/);
+assert.doesNotMatch(overfitHtml,/<i>x/);
+assert.match(vm.runInContext('training.overfit=[];overfitHtml()',context),/No overfitting tests/);
 console.log('Interface rendering, escaping, progress and filtering checks passed');

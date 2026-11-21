@@ -2,7 +2,7 @@
 from datetime import datetime, timezone
 
 MODEL_NAMES = {'churro': 'Churro / 3B', 'olmocr': 'olmOCR-2 / 7B',
-               'lighton': 'LightOnOCR / 4B', 'weight-space': 'Weight-space pilot'}
+               'lighton': 'LightOnOCR / 4B', 'qwen38': 'Qwen3.8 / 27B', 'weight-space': 'Weight-space pilot'}
 
 
 def age(timestamp, now):
@@ -19,6 +19,8 @@ def model_for(run_id):
         return 'olmocr'
     if 'lighton' in run_id:
         return 'lighton'
+    if 'q38' in run_id:
+        return 'qwen38'
     return 'churro'
 
 

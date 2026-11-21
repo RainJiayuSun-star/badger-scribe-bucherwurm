@@ -15,6 +15,7 @@ from live_state import enrich
 import badgerbrain
 import settings
 import history
+import overfit
 
 ROOT = Path(__file__).resolve().parent
 CONFIG = settings.load()
@@ -137,14 +138,16 @@ def training_payload():
     for r in runs:
         val = [[e['epoch'], e['val_macro_cer']] for e in r.get('epochs', [])
                if isinstance(e.get('epoch'), (int, float)) and isinstance(e.get('val_macro_cer'), (int, float))]
+        train = [[e['epoch'], e['train_macro_cer']] for e in r.get('epochs', [])
+                 if isinstance(e.get('epoch'), (int, float)) and isinstance(e.get('train_macro_cer'), (int, float))]
         if r.get('loss') or val or r['id'].startswith('submission-'):
             c = r['config']
             rows.append({'id': r['id'], 'model': history.short(c.get('model_id') or r['summary'].get('model_id')),
                          'fold': r.get('fold'), 'category': history.category(r.get('fold')), 'epochs': c.get('epochs'),
-                         'loss': r.get('loss', []), 'val': val, 'adapters': r.get('adapters'), 'started': r.get('started'),
+                         'loss': r.get('loss', []), 'val': val, 'train': train, 'adapters': r.get('adapters'), 'started': r.get('started'),
                          # the settings that must match for a fold run to stand in for an all-data adapter
                          'setup': [c.get('adapter_policy'), c.get('learning_rate'), c.get('human_repeats') or 1, c.get('category_repeats') or None]})
-    return {'runs': rows, 'public': notes.get('public_scores', {})}
+    return {'runs': rows, 'public': notes.get('public_scores', {}), 'overfit': overfit.summarize(rows)}
 
 
 class Handler(BaseHTTPRequestHandler):
