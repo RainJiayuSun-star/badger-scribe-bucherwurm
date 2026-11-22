@@ -64,8 +64,9 @@ def load_model_and_processor(config: dict[str, Any], local_rank: int):
         if not isinstance(module, torch.nn.Linear):
             continue
         suffix = name.rsplit(".", 1)[-1]
-        is_visual = name.startswith("visual.") or ".visual." in name
-        is_projector = "merger" in name or "projector" in name
+        # Qwen-family models name the vision tower "visual"; LightOnOCR-3-1B (Pixtral) names it "vision_encoder".
+        is_visual = name.startswith("visual.") or ".visual." in name or ".vision_encoder." in name
+        is_projector = "merger" in name or "projector" in name or "vision_projection" in name
         if suffix in language_suffixes and not is_visual:
             targets.append(name)
         elif is_projector:

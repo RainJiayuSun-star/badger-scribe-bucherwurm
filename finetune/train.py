@@ -439,6 +439,7 @@ def run(args: argparse.Namespace, holder: dict[str, RunState]) -> int:
         else:
             state.event("resume_requested_but_no_checkpoint", directory=str(run_dir))
     checkpoint_need = estimate_bytes(accelerator.unwrap_model(model)) + DISK_MARGIN_BYTES
+    mps_only = not torch.cuda.is_available() and torch.backends.mps.is_available()
     progress = tqdm(total=total_steps, initial=global_step, disable=not accelerator.is_local_main_process, desc=f"{config['model_name']} {curriculum['name']}")
     started = time.monotonic()
     try:
@@ -461,6 +462,9 @@ def run(args: argparse.Namespace, holder: dict[str, RunState]) -> int:
                         optimizer.step()
                         scheduler.step()
                         optimizer.zero_grad(set_to_none=True)
+                    if mps_only:
+                        # The MPS allocator keeps freed blocks; without this its cache grew to 42 GiB of a 48 GB Mac and swapped.
+                        torch.mps.empty_cache()
                     if not accelerator.sync_gradients:
                         continue
                     global_step += 1
