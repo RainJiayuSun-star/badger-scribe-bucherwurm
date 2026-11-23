@@ -42,7 +42,8 @@ def write_config(base: Path, out: Path, sets: list[str]) -> dict:
 
 
 def queue_lines(name: str, config: str, clone: str, folds: list[str], minutes: int) -> list[str]:
-    return [f"{name}-{fold} {minutes} {clone} bash ~/badger-scribe-bucherwurm/runs/pm/bin/train_item.sh {name}-{fold} {config} {fold}"
+    """A fold may be a path relative to runs/folds (e.g. ../folds-1120/dominy_group1); the run is named after its last part."""
+    return [f"{name}-{Path(fold).name} {minutes} {clone} bash ~/badger-scribe-bucherwurm/runs/pm/bin/train_item.sh {name}-{Path(fold).name} {config} {fold}"
             for fold in folds]
 
 

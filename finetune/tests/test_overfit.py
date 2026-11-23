@@ -92,3 +92,6 @@ class ReportTests(unittest.TestCase):
         line = overfit.queue_lines("of1", "cfg.yaml", "clone", ["dominy_group1"], 300)[0]
         self.assertEqual(line.split()[:3], ["of1-dominy_group1", "300", "clone"])
         self.assertTrue(line.endswith("train_item.sh of1-dominy_group1 cfg.yaml dominy_group1"))
+        line = overfit.queue_lines("of1", "cfg.yaml", "clone", ["../folds-1120/dominy_group5"], 300)[0]
+        self.assertEqual(line.split()[0], "of1-dominy_group5")
+        self.assertTrue(line.endswith("train_item.sh of1-dominy_group5 cfg.yaml ../folds-1120/dominy_group5"))
