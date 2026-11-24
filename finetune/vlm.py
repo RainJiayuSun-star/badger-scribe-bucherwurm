@@ -10,6 +10,26 @@ from PIL import Image
 PROMPT = "Transcribe every visible text character exactly as written. Preserve spelling, case, punctuation, and reading order. Output only the transcription."
 
 
+def cpu_embedding(embedding):
+    """Frozen input embeddings kept on the CPU, which frees 2.4 GiB of GPU memory on Qwen3.8-27B."""
+    import torch
+
+    class Wrapped(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("anchor", torch.empty(0, device=embedding.weight.device), persistent=False)
+            self.__dict__["cpu_module"] = embedding.cpu().requires_grad_(False)  # unregistered, so model.to() can't move it back
+
+        @property
+        def weight(self):
+            return self.__dict__["cpu_module"].weight
+
+        def forward(self, input_ids):
+            return self.__dict__["cpu_module"](input_ids.cpu()).to(self.anchor.device)
+
+    return Wrapped()
+
+
 def lora_targets(model, config: dict[str, Any]) -> list[str]:
     """Names of the Linear modules that get a LoRA adapter."""
     import torch
@@ -51,11 +71,14 @@ def load_model_and_processor(config: dict[str, Any], local_rank: int):
         raise ValueError(f"quantization must be '4bit' or 'none', got {mode!r}")
     extra = {}
     if mode == "4bit":
+        # Reading handwriting depends on the vision tower, so Qwen3.8 keeps it in bf16.
+        skip = {"llm_int8_skip_modules": ["lm_head", "model.visual"]} if config.get("model_family") == "qwen3_5" else {}
         extra["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_use_double_quant=True,
             bnb_4bit_compute_dtype=dtype,
+            **skip,
         )
     # A pinned revision makes a rerun load the same weights; HF_HUB_CACHE can point at a local copy (EFabric: /models).
     revision = config.get("revision")
@@ -68,6 +91,8 @@ def load_model_and_processor(config: dict[str, Any], local_rank: int):
         trust_remote_code=True,
         **extra,
     )
+    if config.get("model_family") == "qwen3_5":
+        model.set_input_embeddings(cpu_embedding(model.get_input_embeddings()))
     model.config.use_cache = False
     # prepare_model_for_kbit_training casts unquantized weights to fp32: about 10 GiB more on Qwen3.8-27B.
     if mode == "4bit" and config.get("model_family") != "qwen3_5":

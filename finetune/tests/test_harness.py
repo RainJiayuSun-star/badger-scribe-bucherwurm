@@ -246,11 +246,27 @@ class Qwen38Tests(unittest.TestCase):
         from finetune import vlm
 
         for family, calls in (("qwen3_5", 0), ("qwen", 1)):
-            with mock.patch("transformers.AutoProcessor.from_pretrained"), mock.patch("transformers.BitsAndBytesConfig"), \
+            with mock.patch("transformers.AutoProcessor.from_pretrained"), mock.patch("transformers.BitsAndBytesConfig") as bnb, \
                     mock.patch("transformers.AutoModelForImageTextToText.from_pretrained", return_value=self.tiny_model()), \
                     mock.patch("peft.prepare_model_for_kbit_training", side_effect=lambda model, **_: model) as prepare:
                 vlm.load_model_and_processor({"model_id": "m", "quantization": "4bit", "model_family": family}, 0)
             self.assertEqual(prepare.call_count, calls, family)
+            self.assertEqual("model.visual" in bnb.call_args.kwargs.get("llm_int8_skip_modules", []), family == "qwen3_5")
+
+    def test_cpu_embedding_matches_and_stays_out_of_the_model(self):
+        import torch
+
+        from finetune.vlm import cpu_embedding
+
+        model = self.tiny_model()
+        original = model.get_input_embeddings()
+        ids = torch.tensor([[1, 2, 3]])
+        expected = original(ids).detach().clone()
+        model.set_input_embeddings(cpu_embedding(original))
+        self.assertTrue(torch.equal(model.get_input_embeddings()(ids), expected))
+        self.assertFalse(any("embed_tokens" in name for name, _ in model.named_parameters()))
+        model.to(torch.float16)
+        self.assertEqual(model.get_input_embeddings().weight.dtype, expected.dtype, "model.to() must not reach the CPU copy")
 
     def test_thinking_is_off_for_this_family_and_untouched_for_others(self):
         from finetune.vlm import _chat_text
