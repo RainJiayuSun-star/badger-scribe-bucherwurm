@@ -96,7 +96,7 @@ function render(d) {
   snapshot=d;
   names={root:'Coordinator',...(d.names||{})};
   const runs=d.gpus.flatMap(g=>g.runs), tasks=d.agents.tasks;
-  $('active').textContent=d.gpus.filter(g=>!g.stale&&g.runs.some(r=>state(r)==='active')).length+' / 02';
+  $('active').textContent=d.gpus.filter(g=>!g.stale&&g.runs.some(r=>state(r)==='active')).length+' / '+String(d.gpus.length).padStart(2,'0');
   $('finished').textContent=runs.filter(r=>state(r)==='complete').length;
   $('waiting').textContent=tasks.filter(t=>['waiting','blocked'].includes(t.display_state)).length;
   $('fresh-agents').textContent=new Set(tasks.filter(t=>t.display_state==='active').map(t=>t.worker)).size;
@@ -185,7 +185,7 @@ async function load() {
   } catch(e) {
     $('connection').textContent='The dashboard server is not responding. Showing the last data received.';
     $('connection').classList.remove('hidden');
-    $('active').textContent='— / 02';$('fresh-agents').textContent='—';
+    $('active').textContent='—';$('fresh-agents').textContent='—';
   }
 }
 document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{

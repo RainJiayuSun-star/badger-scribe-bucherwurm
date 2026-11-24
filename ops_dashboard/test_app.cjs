@@ -20,7 +20,7 @@ const fixture = {
 };
 context.fixture=fixture;
 vm.runInContext('render(fixture)',context);
-assert.equal(element('active').textContent,'1 / 02');
+assert.equal(element('active').textContent,'1 / 01');
 assert.equal(element('fresh-agents').textContent,0);
 assert.match(element('gpus').innerHTML,/EVAL PAGE 2 \/ 4/);
 assert.match(element('workers').innerHTML,/&lt;script&gt;/);
