@@ -10,45 +10,34 @@ from PIL import Image
 PROMPT = "Transcribe every visible text character exactly as written. Preserve spelling, case, punctuation, and reading order. Output only the transcription."
 
 
-def load_model_and_processor(config: dict[str, Any], local_rank: int):
+def cpu_embedding(embedding):
+    """Frozen input embeddings kept on the CPU, which frees 2.4 GiB of GPU memory on Qwen3.8-27B."""
     import torch
-    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-    from transformers import AutoProcessor, BitsAndBytesConfig
 
-    # The auto class resolves Qwen2.5-VL (Churro, olmOCR) and Qwen3-VL alike.
-    from transformers import AutoModelForImageTextToText as ModelClass
+    class Wrapped(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("anchor", torch.empty(0, device=embedding.weight.device), persistent=False)
+            self.__dict__["cpu_module"] = embedding.cpu().requires_grad_(False)  # unregistered, so model.to() can't move it back
 
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    mode = str(config.get("quantization", "4bit")).lower()
-    if mode not in {"4bit", "none"}:
-        raise ValueError(f"quantization must be '4bit' or 'none', got {mode!r}")
-    extra = {}
-    if mode == "4bit":
-        extra["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=dtype,
-        )
-    # A pinned revision makes a rerun load the same weights; HF_HUB_CACHE can point at a local copy (EFabric: /models).
-    revision = config.get("revision")
-    processor = AutoProcessor.from_pretrained(config["model_id"], revision=revision, trust_remote_code=True)
-    model = ModelClass.from_pretrained(
-        config["model_id"],
-        revision=revision,
-        dtype=dtype,
-        device_map={"": local_rank},
-        trust_remote_code=True,
-        **extra,
-    )
-    model.config.use_cache = False
-    if mode == "4bit":
-        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
-    else:
-        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-    if hasattr(model, "enable_input_require_grads"):
-        model.enable_input_require_grads()
+        @property
+        def weight(self):
+            return self.__dict__["cpu_module"].weight
+
+        def forward(self, input_ids):
+            return self.__dict__["cpu_module"](input_ids.cpu()).to(self.anchor.device)
+
+    return Wrapped()
+
+
+def lora_targets(model, config: dict[str, Any]) -> list[str]:
+    """Names of the Linear modules that get a LoRA adapter."""
+    import torch
+
     language_suffixes = {"q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"}
+    if config.get("model_family") == "qwen3_5":
+        # 48 of Qwen3.8-27B's 64 layers use linear attention, which has none of the suffixes above.
+        language_suffixes |= {"in_proj_qkv", "in_proj_z", "out_proj"}
     targets = []
     for name, module in model.named_modules():
         if not isinstance(module, torch.nn.Linear):
@@ -65,6 +54,54 @@ def load_model_and_processor(config: dict[str, Any], local_rank: int):
     targets = sorted(set(targets))
     if not targets:
         raise RuntimeError("no LoRA target modules found; inspect this model's module names")
+    return targets
+
+
+def load_model_and_processor(config: dict[str, Any], local_rank: int):
+    import torch
+    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+    from transformers import AutoProcessor, BitsAndBytesConfig
+
+    # The auto class resolves Qwen2.5-VL (Churro, olmOCR) and Qwen3-VL alike.
+    from transformers import AutoModelForImageTextToText as ModelClass
+
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    mode = str(config.get("quantization", "4bit")).lower()
+    if mode not in {"4bit", "none"}:
+        raise ValueError(f"quantization must be '4bit' or 'none', got {mode!r}")
+    extra = {}
+    if mode == "4bit":
+        # Reading handwriting depends on the vision tower, so Qwen3.8 keeps it in bf16.
+        skip = {"llm_int8_skip_modules": ["lm_head", "model.visual"]} if config.get("model_family") == "qwen3_5" else {}
+        extra["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=dtype,
+            **skip,
+        )
+    # A pinned revision makes a rerun load the same weights; HF_HUB_CACHE can point at a local copy (EFabric: /models).
+    revision = config.get("revision")
+    processor = AutoProcessor.from_pretrained(config["model_id"], revision=revision, trust_remote_code=True)
+    model = ModelClass.from_pretrained(
+        config["model_id"],
+        revision=revision,
+        dtype=dtype,
+        device_map={"": local_rank},
+        trust_remote_code=True,
+        **extra,
+    )
+    if config.get("model_family") == "qwen3_5":
+        model.set_input_embeddings(cpu_embedding(model.get_input_embeddings()))
+    model.config.use_cache = False
+    # prepare_model_for_kbit_training casts unquantized weights to fp32: about 10 GiB more on Qwen3.8-27B.
+    if mode == "4bit" and config.get("model_family") != "qwen3_5":
+        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+    else:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+    targets = lora_targets(model, config)
     lora = LoraConfig(
         r=int(config.get("lora_rank", 16)),
         lora_alpha=int(config.get("lora_alpha", 32)),
@@ -116,7 +153,8 @@ def messages(image: str | Path | Image.Image, text: str | None = None, max_pixel
 
 
 def _chat_text(processor, item, add_generation_prompt: bool, config: dict[str, Any]) -> str:
-    extra = {"enable_thinking": False} if config.get("model_family") == "lighton" else {}
+    # Qwen3.8's template thinks by default: it adds a reasoning system prompt and leaves <think> open.
+    extra = {"enable_thinking": False} if config.get("model_family") in {"lighton", "qwen3_5"} else {}
     return processor.apply_chat_template(item, tokenize=False, add_generation_prompt=add_generation_prompt, **extra)
 
 

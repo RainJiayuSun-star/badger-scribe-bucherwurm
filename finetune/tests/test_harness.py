@@ -92,7 +92,7 @@ class BaseModelOptionTests(unittest.TestCase):
         from finetune.config import load_config
 
         for name in ("churro-3b-bf16.yaml", "churro-3b-bf16-english.yaml", "olmocr2-7b-bf16-english.yaml",
-                     "lighton3-4b-yale-english.yaml"):
+                     "lighton3-4b-yale-english.yaml", "qwen38-27b-4bit-english.yaml"):
             config = load_config(Path(__file__).parents[1] / "configs" / name)
             self.assertRegex(config["model_id"], r"^[\w.-]+/[\w.-]+$", name)
             self.assertRegex(str(config.get("revision")), r"^[0-9a-f]{40}$", name)
@@ -105,7 +105,7 @@ class BaseModelOptionTests(unittest.TestCase):
         configs = [path for path in (Path(__file__).parents[1] / "configs").glob("*.yaml") if path.name != "curricula.yaml"]
         self.assertTrue(configs)
         for path in configs:
-            if path.name.startswith(("olmocr", "lighton")):
+            if path.name.startswith(("olmocr", "lighton", "qwen38")):
                 continue
             config = load_config(path)
             self.assertFalse({"image_longest_edge", "prompt", "prompt_first", "target_logits_only"} & set(config), path.name)
@@ -203,6 +203,105 @@ class BaseModelOptionTests(unittest.TestCase):
         torch.testing.assert_close(training_loss(model, batch, {"loss_truncation": 0.5}), per_token.sort().values[:4].mean())
         smoothed = torch.nn.functional.cross_entropy(logits[targets != -100], targets[targets != -100], label_smoothing=0.1)
         torch.testing.assert_close(training_loss(model, batch, {"label_smoothing": 0.1}), smoothed)
+
+
+class Qwen38Tests(unittest.TestCase):
+    """Thinking stays off and LoRA reaches the linear-attention layers, on the real Qwen3.5 architecture."""
+
+    @staticmethod
+    def tiny_model():
+        from transformers import Qwen3_5Config, Qwen3_5ForConditionalGeneration
+
+        text = {"vocab_size": 64, "hidden_size": 32, "intermediate_size": 64, "num_hidden_layers": 4, "num_attention_heads": 2,
+                "num_key_value_heads": 1, "head_dim": 16, "linear_num_value_heads": 2, "linear_num_key_heads": 1, "linear_key_head_dim": 8,
+                "linear_value_head_dim": 8, "layer_types": ["linear_attention"] * 3 + ["full_attention"]}
+        vision = {"depth": 1, "hidden_size": 16, "intermediate_size": 32, "num_heads": 2, "out_hidden_size": 32}
+        return Qwen3_5ForConditionalGeneration(Qwen3_5Config(text_config=text, vision_config=vision))
+
+    def test_targets_cover_linear_attention_only_for_this_family(self):
+        from finetune.vlm import lora_targets
+
+        model = self.tiny_model()
+        targets = lora_targets(model, {"model_family": "qwen3_5"})
+        suffixes = {name.rsplit(".", 1)[-1] for name in targets}
+        self.assertLessEqual({"in_proj_qkv", "in_proj_z", "out_proj", "q_proj", "gate_proj", "linear_fc1"}, suffixes)
+        self.assertFalse({"in_proj_a", "in_proj_b", "lm_head", "qkv"} & suffixes)
+        self.assertEqual(sum(name.endswith("linear_attn.in_proj_qkv") for name in targets), 3)
+        self.assertFalse(any("linear_attn" in name for name in lora_targets(model, {})))
+
+    def test_adapter_wraps_the_targets_and_trains(self):
+        from peft import LoraConfig, get_peft_model
+
+        from finetune.vlm import lora_targets
+
+        model = self.tiny_model()
+        wrapped = get_peft_model(model, LoraConfig(r=2, target_modules=lora_targets(model, {"model_family": "qwen3_5"})))
+        names = [name for name, parameter in wrapped.named_parameters() if parameter.requires_grad]
+        self.assertTrue(any("linear_attn.in_proj_qkv.lora_A" in name for name in names))
+        self.assertTrue(all("lora_" in name for name in names))
+
+    def test_4bit_load_keeps_unquantized_weights_in_bf16(self):
+        from unittest import mock
+
+        from finetune import vlm
+
+        for family, calls in (("qwen3_5", 0), ("qwen", 1)):
+            with mock.patch("transformers.AutoProcessor.from_pretrained"), mock.patch("transformers.BitsAndBytesConfig") as bnb, \
+                    mock.patch("transformers.AutoModelForImageTextToText.from_pretrained", return_value=self.tiny_model()), \
+                    mock.patch("peft.prepare_model_for_kbit_training", side_effect=lambda model, **_: model) as prepare:
+                vlm.load_model_and_processor({"model_id": "m", "quantization": "4bit", "model_family": family}, 0)
+            self.assertEqual(prepare.call_count, calls, family)
+            self.assertEqual("model.visual" in bnb.call_args.kwargs.get("llm_int8_skip_modules", []), family == "qwen3_5")
+
+    def test_cpu_embedding_matches_and_stays_out_of_the_model(self):
+        import torch
+
+        from finetune.vlm import cpu_embedding
+
+        model = self.tiny_model()
+        original = model.get_input_embeddings()
+        ids = torch.tensor([[1, 2, 3]])
+        expected = original(ids).detach().clone()
+        model.set_input_embeddings(cpu_embedding(original))
+        self.assertTrue(torch.equal(model.get_input_embeddings()(ids), expected))
+        self.assertFalse(any("embed_tokens" in name for name, _ in model.named_parameters()))
+        model.to(torch.float16)
+        self.assertEqual(model.get_input_embeddings().weight.dtype, expected.dtype, "model.to() must not reach the CPU copy")
+
+    def test_thinking_is_off_for_this_family_and_untouched_for_others(self):
+        from finetune.vlm import _chat_text
+
+        class Processor:
+            def apply_chat_template(self, item, **kwargs):
+                return kwargs
+
+        self.assertIs(_chat_text(Processor(), [], True, {"model_family": "qwen3_5"})["enable_thinking"], False)
+        self.assertNotIn("enable_thinking", _chat_text(Processor(), [], True, {}))
+
+
+class ScreenGatewayTests(unittest.TestCase):
+    def test_refuses_test_pages_and_keeps_the_image_budget(self):
+        import base64
+        import io
+        import tempfile
+        from pathlib import Path
+
+        from PIL import Image
+
+        from finetune.screen_gateway import page_url, refuse_test_pages
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "test.csv").write_text("page_id,doc_id\nkade_009_p001,kade_009\n", encoding="utf-8")
+            refuse_test_pages({"kade_103_p001"}, root)
+            with self.assertRaises(SystemExit):
+                refuse_test_pages({"kade_103_p001", "kade_009_p001"}, root)
+            Image.new("RGB", (3063, 2589), "white").save(root / "page.jpg")
+            url, (width, height) = page_url(root / "page.jpg", 1310720)
+        self.assertEqual((width % 32, height % 32), (0, 0))
+        self.assertLessEqual(width * height, 1310720)
+        with Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1]))) as sent:
+            self.assertEqual(sent.size, (width, height))
 
 
 class FakeTokenizer:
